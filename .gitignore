@@ -1,0 +1,12 @@
+
+#Mac system file
+.DS_Store
+
+# remove pycache
+*.pyc
+*.pyo
+
+# annoying!
+*.log 
+
+# ./data 
