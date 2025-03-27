@@ -486,7 +486,7 @@ class StockImpactAnalyzer:
         
         Args:
             row: Series representing a news article
-            
+                
         Returns:
             List of stock tickers
         """
@@ -506,15 +506,18 @@ class StockImpactAnalyzer:
                 else:
                     tickers = [row['tickers']]
         
-        # Extract from filename if available
-        elif 'Link' in row and row['Link']:
-            # Extract ticker from filename pattern like "yna_005930_2025.csv"
-            link = row['Link']
-            if isinstance(link, str):
-                parts = link.split('_')
-                for part in parts:
-                    if part.isdigit() and len(part) == 6:
-                        tickers.append(part)
+        # Instead of extracting from the Link, use the Title field to determine the company
+        elif 'Title' in row and row['Title']:
+            title = row['Title']
+            # Create a mapping of company names to their corresponding tickers
+            company_to_ticker = {
+                "삼성전자": "005930",
+                "SK그룹": "000660",   # Replace with the correct ticker if different
+                # Add more mappings as needed
+            }
+            for company, ticker in company_to_ticker.items():
+                if company in title:
+                    tickers.append(ticker)
         
         return tickers
     
