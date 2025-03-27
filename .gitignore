@@ -11,4 +11,5 @@
 
 # ./data 
 /models
+/results
 /data/news/yna_005930_all.csv
