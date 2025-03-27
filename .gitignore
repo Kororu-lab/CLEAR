@@ -10,3 +10,5 @@
 *.log 
 
 # ./data 
+/models
+/data/news/yna_005930_all.csv
