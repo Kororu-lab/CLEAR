@@ -1,0 +1,50 @@
+data_dir: data
+models_dir: models
+results_dir: results
+use_gpu: true
+stock_tickers:
+  - '005930'  # Samsung Electronics
+news_crawler:
+  source: yna
+  use_ai_summary: true
+text_preprocessor:
+  language: ko
+  use_mecab: true
+  remove_stopwords: true
+  min_token_length: 2
+news_vectorizer:
+  method: tfidf
+  max_features: 10000
+  embedding_dim: 300
+  title_weight: 2.0
+  combine_title_content: true
+  reduce_dims: true
+  n_components: 100
+news_clustering:
+  distance_threshold: 0.7
+  min_cluster_size: 3
+  max_cluster_size: 20
+  linkage: average
+stock_impact:
+  time_windows:
+    - name: immediate
+      hours: 1
+    - name: short_term
+      hours: 24
+    - name: medium_term
+      days: 3
+  impact_thresholds:
+    high: 0.02    # 2% price change
+    medium: 0.01  # 1% price change
+    low: 0.005    # 0.5% price change
+  model_type: random_forest
+news_recommender:
+  weights:
+    impact: 0.4      # Stock Impact (SI)
+    quality: 0.2     # Quality Estimation (QE)
+    content: 0.2     # Content-Based Filtering (CBF)
+    collaborative: 0.1 # Collaborative Filtering (CF)
+    recency: 0.1      # Latest news prioritization
+schedule:
+  market_open: '09:00'
+  market_close: '15:30'
