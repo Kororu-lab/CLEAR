@@ -61,7 +61,7 @@ class NewsClustering:
         self.clustering = AgglomerativeClustering(
             n_clusters=n_clusters,
             distance_threshold=None if n_clusters else distance_threshold,
-            affinity='cosine',
+            metric='cosine',
             linkage=linkage,
             compute_distances=True
         )
@@ -345,7 +345,7 @@ class NewsClustering:
             n_subclusters = max(2, len(cluster_articles) // self.max_cluster_size + 1)
             subclustering = AgglomerativeClustering(
                 n_clusters=n_subclusters,
-                affinity='cosine',
+                metric='cosine',
                 linkage=self.linkage
             )
             
