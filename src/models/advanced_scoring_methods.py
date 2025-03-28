@@ -164,7 +164,7 @@ class AdvancedScoringMethods:
             if self.similarity_cache:
                 similarity_cache_path = os.path.join(self.models_dir, "similarity_cache.json")
                 with open(similarity_cache_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.similarity_cache, f)
+                    json.dump(self.similarity_cache, f, default=lambda x: float(x) if isinstance(x, np.float32) else x)
                 logger.info(f"Saved similarity cache with {len(self.similarity_cache)} entries")
             
             # Save embedding cache
@@ -175,7 +175,7 @@ class AdvancedScoringMethods:
                 cache_data = {k: v.tolist() for k, v in self.embedding_cache.items()}
                 
                 with open(embedding_cache_path, 'w', encoding='utf-8') as f:
-                    json.dump(cache_data, f)
+                    json.dump(cache_data, f, default=lambda x: float(x) if isinstance(x, np.float32) else x)
                 logger.info(f"Saved embedding cache with {len(self.embedding_cache)} entries")
         except Exception as e:
             logger.error(f"Error saving cache: {str(e)}")
@@ -428,4 +428,210 @@ class AdvancedScoringMethods:
             text2: Second text
             weights: Dictionary mapping model names to weights
             
-      <response clipped><NOTE>To save on context only part of this file has been shown to you. You should retry this tool after you have searched inside the file with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>
+        Returns:
+            Weighted ensemble similarity score between 0 and 1
+        """
+        if weights is None:
+            # Default weights
+            weights = {}
+            if self.use_kosimcse:
+                weights['kosimcse'] = 0.6
+            if self.use_bge_korean:
+                weights['bge_korean'] = 0.4
+        
+        # Normalize weights
+        total_weight = sum(weights.values())
+        if total_weight == 0:
+            return self.calculate_similarity(text1, text2, 'default')
+        
+        normalized_weights = {k: v / total_weight for k, v in weights.items()}
+        
+        # Calculate weighted similarity
+        weighted_similarity = 0.0
+        for model, weight in normalized_weights.items():
+            similarity = self.calculate_similarity(text1, text2, model)
+            weighted_similarity += similarity * weight
+        
+        return weighted_similarity
+    
+    def calculate_impact_score(self, news_text: str, sentiment_score: float, price_change_pct: float, model: str = 'default') -> float:
+        """
+        Calculate impact score of news on stock price.
+        
+        Args:
+            news_text: News text
+            sentiment_score: Sentiment score between -1 and 1
+            price_change_pct: Price change percentage
+            model: Model to use for embedding
+            
+        Returns:
+            Impact score between -1 and 1
+        """
+        # Extract key financial terms from news
+        financial_terms = self._extract_financial_terms(news_text)
+        
+        # Calculate term importance
+        term_importance = self._calculate_term_importance(financial_terms)
+        
+        # Calculate correlation factor
+        correlation_factor = self._calculate_correlation_factor(sentiment_score, price_change_pct)
+        
+        # Calculate impact score
+        impact_score = sentiment_score * term_importance * correlation_factor
+        
+        return impact_score
+    
+    def _extract_financial_terms(self, text: str) -> List[str]:
+        """
+        Extract key financial terms from text.
+        
+        Args:
+            text: Text to analyze
+            
+        Returns:
+            List of financial terms
+        """
+        # Simple financial term extraction
+        financial_terms = [
+            '실적', '매출', '영업이익', '순이익', '증가', '감소', '성장', '하락',
+            '투자', '주가', '시장', '경쟁', '전망', '계약', '개발', '출시',
+            '인수', '합병', '파트너십', '협약', '기술', '특허', '연구', '혁신'
+        ]
+        
+        return [term for term in financial_terms if term in text]
+    
+    def _calculate_term_importance(self, terms: List[str]) -> float:
+        """
+        Calculate importance of financial terms.
+        
+        Args:
+            terms: List of financial terms
+            
+        Returns:
+            Term importance score between 0 and 1
+        """
+        if not terms:
+            return 0.5  # Neutral importance
+        
+        # Calculate term importance based on number of terms
+        term_count_factor = min(1.0, len(terms) / 5)  # Cap at 1.0
+        
+        # Calculate importance
+        importance = 0.5 + (0.5 * term_count_factor)
+        
+        return importance
+    
+    def _calculate_correlation_factor(self, sentiment_score: float, price_change_pct: float) -> float:
+        """
+        Calculate correlation factor between sentiment and price change.
+        
+        Args:
+            sentiment_score: Sentiment score between -1 and 1
+            price_change_pct: Price change percentage
+            
+        Returns:
+            Correlation factor between 0 and 1
+        """
+        # Normalize price change to -1 to 1 range
+        normalized_price_change = np.tanh(price_change_pct / 5.0)  # 5% change is significant
+        
+        # Calculate correlation
+        if sentiment_score * normalized_price_change > 0:
+            # Same direction (positive correlation)
+            correlation = 0.8
+        elif sentiment_score * normalized_price_change < 0:
+            # Opposite direction (negative correlation)
+            correlation = 0.2
+        else:
+            # No correlation
+            correlation = 0.5
+        
+        return correlation
+    
+    def calculate_ensemble_impact_scores(self, df: pd.DataFrame, text_col: str, sentiment_col: str, price_change_col: str, models: List[str] = None, weights: List[float] = None) -> pd.DataFrame:
+        """
+        Calculate ensemble impact scores for a dataframe of news.
+        
+        Args:
+            df: Dataframe with news and price data
+            text_col: Column name for news text
+            sentiment_col: Column name for sentiment score
+            price_change_col: Column name for price change percentage
+            models: List of models to use
+            weights: List of weights for models
+            
+        Returns:
+            Dataframe with impact scores
+        """
+        # Copy dataframe to avoid modifying original
+        result_df = df.copy()
+        
+        # Default models and weights
+        if models is None:
+            models = []
+            if self.use_kosimcse:
+                models.append('kosimcse')
+            if self.use_bge_korean:
+                models.append('bge_korean')
+            if not models:
+                models = ['default']
+        
+        if weights is None:
+            weights = [1.0 / len(models)] * len(models)
+        
+        # Ensure weights sum to 1
+        weights = np.array(weights) / sum(weights)
+        
+        # Calculate impact scores for each model
+        for i, model in enumerate(models):
+            col_name = f"impact_{model}"
+            result_df[col_name] = result_df.apply(
+                lambda row: self.calculate_impact_score(
+                    row[text_col], 
+                    row[sentiment_col], 
+                    row[price_change_col], 
+                    model
+                ), 
+                axis=1
+            )
+        
+        # Calculate ensemble impact score
+        result_df['impact_ensemble'] = 0.0
+        for i, model in enumerate(models):
+            col_name = f"impact_{model}"
+            result_df['impact_ensemble'] += result_df[col_name] * weights[i]
+        
+        return result_df
+    
+    def visualize_impact_scores(self, df: pd.DataFrame, text_col: str, impact_cols: List[str], title: str = "Impact Scores Comparison"):
+        """
+        Visualize impact scores for different models.
+        
+        Args:
+            df: Dataframe with impact scores
+            text_col: Column name for text labels
+            impact_cols: List of column names for impact scores
+            title: Plot title
+        """
+        # Prepare data for plotting
+        plot_data = []
+        for i, row in df.iterrows():
+            for col in impact_cols:
+                plot_data.append({
+                    'Text': row[text_col][:30] + "..." if len(row[text_col]) > 30 else row[text_col],
+                    'Model': col.replace('impact_', ''),
+                    'Impact Score': row[col]
+                })
+        
+        plot_df = pd.DataFrame(plot_data)
+        
+        # Plot
+        plt.figure(figsize=(12, 6))
+        sns.barplot(x='Text', y='Impact Score', hue='Model', data=plot_df)
+        plt.title(title)
+        plt.xlabel('News Text')
+        plt.ylabel('Impact Score')
+        plt.xticks(rotation=45, ha='right')
+        plt.legend(title='Model')
+        plt.tight_layout()
+        plt.show()

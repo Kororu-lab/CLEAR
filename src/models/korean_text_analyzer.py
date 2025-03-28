@@ -424,4 +424,3 @@ class KoreanFinancialTextAnalyzer:
         plt.ylabel('Sentiment Score')
         plt.tight_layout()
         plt.show()
-"""

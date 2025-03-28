@@ -392,6 +392,64 @@ class NewsClustering:
             logger.error(f"Error generating cluster topic: {str(e)}")
             return f"Cluster {cluster_df['cluster_id'].iloc[0]}"
     
+    def get_trending_clusters(self, articles_df: pd.DataFrame, 
+                             timeframe_hours: int = 24,
+                             min_articles: int = 5) -> List[int]:
+        """
+        Identify trending clusters based on article volume and recency.
+        
+        Args:
+            articles_df: DataFrame containing clustered articles
+            timeframe_hours: Timeframe in hours to consider for trending
+            min_articles: Minimum number of articles to consider a cluster trending
+            
+        Returns:
+            List of trending cluster IDs
+        """
+        if len(articles_df) == 0 or 'cluster_id' not in articles_df.columns:
+            logger.warning("Invalid DataFrame provided for trending clusters")
+            return []
+            
+        if 'Date' not in articles_df.columns:
+            logger.warning("Date column not found in DataFrame")
+            return []
+            
+        logger.info(f"Identifying trending clusters in the last {timeframe_hours} hours")
+        
+        try:
+            # Create a copy to avoid modifying the original
+            df = articles_df.copy()
+            
+            # Convert Date column to datetime if it's not already
+            if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+                # Handle the specific date format (20250101 18:56)
+                df['Date'] = df['Date'].apply(lambda x: pd.to_datetime(str(x).split()[0], format='%Y%m%d'))
+            
+            # Calculate cutoff time
+            cutoff_time = datetime.now() - timedelta(hours=timeframe_hours)
+            
+            # Filter articles within timeframe
+            recent_df = df[df['Date'] >= cutoff_time]
+            
+            if len(recent_df) == 0:
+                logger.warning(f"No articles found within the last {timeframe_hours} hours")
+                return []
+            
+            # Count articles per cluster
+            cluster_counts = recent_df['cluster_id'].value_counts()
+            
+            # Filter clusters with minimum number of articles
+            trending_clusters = cluster_counts[cluster_counts >= min_articles].index.tolist()
+            
+            # Filter out invalid clusters (-1)
+            trending_clusters = [c for c in trending_clusters if c >= 0]
+            
+            logger.info(f"Identified {len(trending_clusters)} trending clusters")
+            return trending_clusters
+        except Exception as e:
+            logger.error(f"Error identifying trending clusters: {str(e)}")
+            return []
+
     def _find_common_words(self, texts: List[str], 
                          min_count: int = 2, 
                          max_words: int = 5) -> List[str]:

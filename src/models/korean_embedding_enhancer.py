@@ -419,4 +419,234 @@ class KoreanEmbeddingEnhancer:
             with torch.no_grad():
                 outputs = self.bge_korean_model(**inputs)
                 embeddings = outputs.last_hidden_state[:, 0, :]  # CLS token
-<response clipped><NOTE>To save on context only part of this file has been shown to you. You should retry this tool after you have searched inside the file with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>
+            
+            # Convert to numpy array
+            embedding = embeddings.cpu().numpy()[0]
+            
+            return embedding
+        except Exception as e:
+            logger.error(f"Error in bge-m3-korean embedding: {str(e)}")
+            # Fall back to simple embedding
+            return self._get_simple_embedding(text)
+    
+    def _get_simple_embedding(self, text: str) -> np.ndarray:
+        """
+        Get simple TF-IDF-like embedding for text.
+        
+        Args:
+            text: Text to embed
+            
+        Returns:
+            Embedding vector as numpy array
+        """
+        # Simple character-level embedding
+        chars = list(set(text))
+        embedding = np.zeros(768)  # Use same dimension as BERT models
+        
+        for i, char in enumerate(chars[:768]):
+            embedding[i] = text.count(char) / len(text)
+        
+        # Normalize
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+        
+        return embedding
+    
+    def get_embeddings_batch(self, texts: List[str], model: str = 'default', 
+                           batch_size: int = 32, show_progress: bool = False) -> np.ndarray:
+        """
+        Get embeddings for a batch of texts.
+        
+        Args:
+            texts: List of texts to embed
+            model: Model to use ('kobert', 'klue_roberta', 'kosimcse', 'bge_korean', or 'default')
+            batch_size: Batch size for processing
+            show_progress: Whether to show progress bar
+            
+        Returns:
+            Array of embeddings
+        """
+        n = len(texts)
+        
+        # Get embedding dimension from a sample text
+        sample_embedding = self.get_embedding(texts[0] if texts else "", model)
+        embedding_dim = sample_embedding.shape[0]
+        
+        # Initialize embeddings array
+        embeddings = np.zeros((n, embedding_dim))
+        
+        # Process in batches
+        iterator = range(0, n, batch_size)
+        if show_progress:
+            iterator = tqdm(iterator, desc=f"Getting {model} embeddings")
+        
+        for i in iterator:
+            batch_texts = texts[i:min(i+batch_size, n)]
+            batch_size_actual = len(batch_texts)
+            
+            # Process each text in the batch
+            for j, text in enumerate(batch_texts):
+                embeddings[i+j] = self.get_embedding(text, model)
+        
+        return embeddings
+    
+    def get_ensemble_embeddings(self, texts: List[str], weights: Dict[str, float] = None, 
+                              batch_size: int = 32, show_progress: bool = False) -> np.ndarray:
+        """
+        Get ensemble embeddings using multiple models with weights.
+        
+        Args:
+            texts: List of texts to embed
+            weights: Dictionary mapping model names to weights
+            batch_size: Batch size for processing
+            show_progress: Whether to show progress bar
+            
+        Returns:
+            Array of ensemble embeddings
+        """
+        if weights is None:
+            # Default weights
+            weights = {}
+            if self.use_kobert:
+                weights['kobert'] = 0.5
+            if self.use_klue_roberta:
+                weights['klue_roberta'] = 0.5
+            if self.use_kosimcse:
+                weights['kosimcse'] = 0.0
+            if self.use_bge_korean:
+                weights['bge_korean'] = 0.0
+        
+        # Filter out models with zero weight or not available
+        weights = {k: v for k, v in weights.items() if v > 0}
+        
+        # If no weights, use default model
+        if not weights:
+            return self.get_embeddings_batch(texts, 'default', batch_size, show_progress)
+        
+        # Normalize weights
+        total_weight = sum(weights.values())
+        normalized_weights = {k: v / total_weight for k, v in weights.items()}
+        
+        # Get embeddings for each model
+        model_embeddings = {}
+        for model in normalized_weights.keys():
+            model_embeddings[model] = self.get_embeddings_batch(texts, model, batch_size, show_progress)
+        
+        # Get embedding dimension from the first model
+        first_model = next(iter(model_embeddings.keys()))
+        embedding_dim = model_embeddings[first_model].shape[1]
+        
+        # Initialize ensemble embeddings
+        ensemble_embeddings = np.zeros((len(texts), embedding_dim))
+        
+        # Add weighted embeddings
+        for model, weight in normalized_weights.items():
+            ensemble_embeddings += model_embeddings[model] * weight
+        
+        # Normalize embeddings
+        for i in range(len(ensemble_embeddings)):
+            norm = np.linalg.norm(ensemble_embeddings[i])
+            if norm > 0:
+                ensemble_embeddings[i] = ensemble_embeddings[i] / norm
+        
+        return ensemble_embeddings
+    
+    def compare_models(self, texts: List[str], reference_text: str, models: List[str] = None, 
+                     batch_size: int = 32) -> Dict[str, List[float]]:
+        """
+        Compare similarity scores from different models.
+        
+        Args:
+            texts: List of texts to compare
+            reference_text: Reference text to compare against
+            models: List of models to use
+            batch_size: Batch size for processing
+            
+        Returns:
+            Dictionary mapping model names to lists of similarity scores
+        """
+        if models is None:
+            models = []
+            if self.use_kobert:
+                models.append('kobert')
+            if self.use_klue_roberta:
+                models.append('klue_roberta')
+            if self.use_kosimcse:
+                models.append('kosimcse')
+            if self.use_bge_korean:
+                models.append('bge_korean')
+        
+        # Get reference embedding for each model
+        reference_embeddings = {}
+        for model in models:
+            reference_embeddings[model] = self.get_embedding(reference_text, model)
+        
+        # Get embeddings for each model
+        model_embeddings = {}
+        for model in models:
+            embeddings = self.get_embeddings_batch(texts, model, batch_size)
+            model_embeddings[model] = embeddings
+        
+        # Calculate similarity scores
+        similarity_scores = {}
+        for model in models:
+            ref_embedding = reference_embeddings[model]
+            embeddings = model_embeddings[model]
+            
+            scores = []
+            for embedding in embeddings:
+                # Calculate cosine similarity
+                dot_product = np.dot(ref_embedding, embedding)
+                norm1 = np.linalg.norm(ref_embedding)
+                norm2 = np.linalg.norm(embedding)
+                
+                if norm1 == 0 or norm2 == 0:
+                    scores.append(0.0)
+                else:
+                    similarity = dot_product / (norm1 * norm2)
+                    scores.append(max(0.0, min(1.0, similarity)))
+            
+            similarity_scores[model] = scores
+        
+        return similarity_scores
+    
+    def visualize_model_comparison(self, texts: List[str], reference_text: str, models: List[str] = None, 
+                                 batch_size: int = 32, title: str = "Model Comparison"):
+        """
+        Visualize comparison of similarity scores from different models.
+        
+        Args:
+            texts: List of texts to compare
+            reference_text: Reference text to compare against
+            models: List of models to use
+            batch_size: Batch size for processing
+            title: Plot title
+        """
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        # Get similarity scores
+        similarity_scores = self.compare_models(texts, reference_text, models, batch_size)
+        
+        # Prepare data for plotting
+        data = []
+        for model, scores in similarity_scores.items():
+            for i, score in enumerate(scores):
+                data.append({
+                    'Model': model,
+                    'Text Index': i,
+                    'Similarity': score
+                })
+        
+        df = pd.DataFrame(data)
+        
+        # Plot
+        plt.figure(figsize=(12, 6))
+        sns.barplot(x='Text Index', y='Similarity', hue='Model', data=df)
+        plt.title(title)
+        plt.xlabel('Text Index')
+        plt.ylabel('Similarity Score')
+        plt.legend(title='Model')
+        plt.tight_layout()
+        plt.show()
