@@ -1,6 +1,7 @@
 
 #Mac system file
 .DS_Store
+src/.DS_Store
 
 # remove pycache
 *.pyc
@@ -15,4 +16,4 @@
 /data/news/yna_005930_all.csv
 
 todo.md
-src/.DS_Store
+
