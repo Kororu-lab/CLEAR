@@ -1,18 +1,17 @@
 """
-Advanced Korean text analysis models for financial news.
-Implements various models for Korean text processing, including KO-finbert and advanced embeddings.
+Korean financial text analyzer module with KO-finbert support.
+Provides sentiment analysis and financial impact scoring for Korean news.
 """
 
 import os
 import logging
-import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Union
 import json
-import re
-from datetime import datetime
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
@@ -23,36 +22,28 @@ logger = logging.getLogger(__name__)
 
 class KoreanFinancialTextAnalyzer:
     """
-    Advanced analyzer for Korean financial text using various models.
+    Korean financial text analyzer with KO-finbert support.
+    Provides sentiment analysis and financial impact scoring for Korean news.
     """
     
     def __init__(self, 
-                 models_dir: str = None,
                  use_finbert: bool = True,
-                 use_kobert: bool = False,
-                 use_openai: bool = False,
-                 openai_api_key: str = None,
-                 cache_embeddings: bool = True,
-                 device: str = 'cpu'):
+                 use_advanced_embeddings: bool = False,
+                 cache_results: bool = True,
+                 models_dir: str = None):
         """
         Initialize the Korean financial text analyzer.
         
         Args:
-            models_dir: Directory to save/load models and cache
             use_finbert: Whether to use KO-finbert for sentiment analysis
-            use_kobert: Whether to use KoBERT for embeddings
-            use_openai: Whether to use OpenAI API for embeddings
-            openai_api_key: OpenAI API key (if using OpenAI)
-            cache_embeddings: Whether to cache embeddings
-            device: Device to use for model inference ('cpu' or 'cuda')
+            use_advanced_embeddings: Whether to use advanced embeddings
+            cache_results: Whether to cache results
+            models_dir: Directory to save/load models and cache
         """
-        self.models_dir = models_dir or os.path.join(os.getcwd(), "models", "text_analysis")
         self.use_finbert = use_finbert
-        self.use_kobert = use_kobert
-        self.use_openai = use_openai
-        self.openai_api_key = openai_api_key
-        self.cache_embeddings = cache_embeddings
-        self.device = device
+        self.use_advanced_embeddings = use_advanced_embeddings
+        self.cache_results = cache_results
+        self.models_dir = models_dir or os.path.join(os.getcwd(), "models", "text_analyzer")
         
         # Create models directory if it doesn't exist
         os.makedirs(self.models_dir, exist_ok=True)
@@ -60,39 +51,28 @@ class KoreanFinancialTextAnalyzer:
         # Initialize models
         self.finbert_model = None
         self.finbert_tokenizer = None
-        self.kobert_model = None
-        self.kobert_tokenizer = None
         
         # Initialize cache
-        self.embedding_cache = {}
-        self.sentiment_cache = {}
+        self.analysis_cache = {}
         
         # Load models if enabled
         if self.use_finbert:
             self._initialize_finbert()
         
-        if self.use_kobert:
-            self._initialize_kobert()
-        
-        if self.use_openai and not self.openai_api_key:
-            logger.warning("OpenAI API key not provided, disabling OpenAI embeddings")
-            self.use_openai = False
-        
         # Load cache if available
-        if self.cache_embeddings:
+        if self.cache_results:
             self._load_cache()
         
-        logger.info(f"Initialized KoreanFinancialTextAnalyzer with models: " +
-                   f"finbert={self.use_finbert}, kobert={self.use_kobert}, openai={self.use_openai}")
+        logger.info(f"Initialized KoreanFinancialTextAnalyzer with finbert={self.use_finbert}, " +
+                   f"advanced_embeddings={self.use_advanced_embeddings}")
     
     def _initialize_finbert(self):
         """
         Initialize the KO-finbert model for sentiment analysis.
         """
         try:
-            # Import here to avoid dependency if not using finbert
+            # Import here to avoid dependency if not using the model
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
-            import torch
             
             # Load KO-finbert model and tokenizer
             model_name = "snunlp/KR-FinBert-SC"
@@ -102,13 +82,8 @@ class KoreanFinancialTextAnalyzer:
             self.finbert_tokenizer = AutoTokenizer.from_pretrained(model_name)
             self.finbert_model = AutoModelForSequenceClassification.from_pretrained(model_name)
             
-            # Move to specified device
-            if self.device == 'cuda' and torch.cuda.is_available():
-                self.finbert_model = self.finbert_model.to('cuda')
-                logger.info("Using CUDA for KO-finbert")
-            else:
-                self.finbert_model = self.finbert_model.to('cpu')
-                logger.info("Using CPU for KO-finbert")
+            # Move to CPU (for demo purposes)
+            self.finbert_model = self.finbert_model.to('cpu')
             
             # Set to evaluation mode
             self.finbert_model.eval()
@@ -116,99 +91,84 @@ class KoreanFinancialTextAnalyzer:
             logger.info("KO-finbert model loaded successfully")
         except Exception as e:
             logger.error(f"Error initializing KO-finbert: {str(e)}")
-            logger.warning("Falling back to rule-based sentiment analysis")
             self.use_finbert = False
-    
-    def _initialize_kobert(self):
-        """
-        Initialize the KoBERT model for embeddings.
-        """
-        try:
-            # Import here to avoid dependency if not using kobert
-            from transformers import BertModel, BertTokenizer
-            import torch
-            
-            # Load KoBERT model and tokenizer
-            model_name = "monologg/kobert"
-            
-            logger.info(f"Loading KoBERT model: {model_name}")
-            
-            self.kobert_tokenizer = BertTokenizer.from_pretrained(model_name)
-            self.kobert_model = BertModel.from_pretrained(model_name)
-            
-            # Move to specified device
-            if self.device == 'cuda' and torch.cuda.is_available():
-                self.kobert_model = self.kobert_model.to('cuda')
-                logger.info("Using CUDA for KoBERT")
-            else:
-                self.kobert_model = self.kobert_model.to('cpu')
-                logger.info("Using CPU for KoBERT")
-            
-            # Set to evaluation mode
-            self.kobert_model.eval()
-            
-            logger.info("KoBERT model loaded successfully")
-        except Exception as e:
-            logger.error(f"Error initializing KoBERT: {str(e)}")
-            logger.warning("Disabling KoBERT embeddings")
-            self.use_kobert = False
     
     def _load_cache(self):
         """
-        Load embedding and sentiment cache from disk.
+        Load analysis cache from disk.
         """
         try:
-            # Load embedding cache
-            embedding_cache_path = os.path.join(self.models_dir, "embedding_cache.json")
-            if os.path.exists(embedding_cache_path):
-                with open(embedding_cache_path, 'r', encoding='utf-8') as f:
-                    # JSON can't handle numpy arrays directly, so we stored them as lists
-                    cache_data = json.load(f)
-                    self.embedding_cache = {k: np.array(v) for k, v in cache_data.items()}
-                logger.info(f"Loaded embedding cache with {len(self.embedding_cache)} entries")
-            
-            # Load sentiment cache
-            sentiment_cache_path = os.path.join(self.models_dir, "sentiment_cache.json")
-            if os.path.exists(sentiment_cache_path):
-                with open(sentiment_cache_path, 'r', encoding='utf-8') as f:
-                    self.sentiment_cache = json.load(f)
-                logger.info(f"Loaded sentiment cache with {len(self.sentiment_cache)} entries")
+            # Load analysis cache
+            analysis_cache_path = os.path.join(self.models_dir, "analysis_cache.json")
+            if os.path.exists(analysis_cache_path):
+                with open(analysis_cache_path, 'r', encoding='utf-8') as f:
+                    self.analysis_cache = json.load(f)
+                logger.info(f"Loaded analysis cache with {len(self.analysis_cache)} entries")
         except Exception as e:
             logger.error(f"Error loading cache: {str(e)}")
-            self.embedding_cache = {}
-            self.sentiment_cache = {}
+            self.analysis_cache = {}
     
     def _save_cache(self):
         """
-        Save embedding and sentiment cache to disk.
+        Save analysis cache to disk.
         """
-        if not self.cache_embeddings:
+        if not self.cache_results:
             return
             
         try:
-            # Save embedding cache
-            if self.embedding_cache:
-                embedding_cache_path = os.path.join(self.models_dir, "embedding_cache.json")
-                
-                # Convert numpy arrays to lists for JSON serialization
-                cache_data = {k: v.tolist() for k, v in self.embedding_cache.items()}
-                
-                with open(embedding_cache_path, 'w', encoding='utf-8') as f:
-                    json.dump(cache_data, f)
-                logger.info(f"Saved embedding cache with {len(self.embedding_cache)} entries")
-            
-            # Save sentiment cache
-            if self.sentiment_cache:
-                sentiment_cache_path = os.path.join(self.models_dir, "sentiment_cache.json")
-                with open(sentiment_cache_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.sentiment_cache, f)
-                logger.info(f"Saved sentiment cache with {len(self.sentiment_cache)} entries")
+            # Save analysis cache
+            if self.analysis_cache:
+                analysis_cache_path = os.path.join(self.models_dir, "analysis_cache.json")
+                with open(analysis_cache_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.analysis_cache, f)
+                logger.info(f"Saved analysis cache with {len(self.analysis_cache)} entries")
         except Exception as e:
             logger.error(f"Error saving cache: {str(e)}")
     
-    def analyze_sentiment(self, text: str) -> Dict[str, Any]:
+    def analyze_text(self, text: str) -> Dict[str, Any]:
         """
-        Analyze sentiment of Korean financial text.
+        Analyze Korean financial text for sentiment and impact.
+        
+        Args:
+            text: Text to analyze
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        # Check cache first
+        if self.cache_results and text in self.analysis_cache:
+            return self.analysis_cache[text]
+        
+        # Analyze sentiment
+        if self.use_finbert and self.finbert_model is not None:
+            sentiment_result = self._analyze_sentiment_finbert(text)
+        else:
+            sentiment_result = self._analyze_sentiment_simple(text)
+        
+        # Extract financial entities
+        financial_entities = self._extract_financial_entities(text)
+        
+        # Combine results
+        result = {
+            'text': text,
+            'sentiment_score': sentiment_result['sentiment_score'],
+            'sentiment_label': sentiment_result['sentiment_label'],
+            'confidence': sentiment_result['confidence'],
+            'financial_entities': financial_entities
+        }
+        
+        # Cache result
+        if self.cache_results:
+            self.analysis_cache[text] = result
+            # Periodically save cache
+            if len(self.analysis_cache) % 100 == 0:
+                self._save_cache()
+        
+        return result
+    
+    def _analyze_sentiment_finbert(self, text: str) -> Dict[str, Any]:
+        """
+        Analyze sentiment using KO-finbert model.
         
         Args:
             text: Text to analyze
@@ -216,577 +176,252 @@ class KoreanFinancialTextAnalyzer:
         Returns:
             Dictionary with sentiment analysis results
         """
-        if not text or not isinstance(text, str):
-            return {'score': 0.0, 'label': 'neutral', 'confidence': 0.0}
-        
-        # Check cache
-        if text in self.sentiment_cache:
-            return self.sentiment_cache[text]
-        
         try:
-            # Use KO-finbert if available
-            if self.use_finbert and self.finbert_model is not None:
-                import torch
-                
-                # Tokenize text
-                inputs = self.finbert_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-                
-                # Move to same device as model
-                if self.device == 'cuda' and torch.cuda.is_available():
-                    inputs = {k: v.to('cuda') for k, v in inputs.items()}
-                
-                # Get sentiment prediction
-                with torch.no_grad():
-                    outputs = self.finbert_model(**inputs)
-                    predictions = outputs.logits.softmax(dim=1)
-                
-                # Get sentiment score and label
-                # KR-FinBert-SC has 3 classes: negative (0), neutral (1), positive (2)
-                probs = predictions[0].cpu().numpy()
-                
-                # Convert to -1 to 1 scale
-                sentiment_score = probs[2] - probs[0]  # positive - negative
-                
-                # Get label
-                label_idx = predictions[0].argmax().item()
-                labels = ['negative', 'neutral', 'positive']
-                sentiment_label = labels[label_idx]
-                
-                # Get confidence
-                confidence = probs[label_idx]
-                
-                result = {
-                    'score': float(sentiment_score),
-                    'label': sentiment_label,
-                    'confidence': float(confidence),
-                    'probabilities': {
-                        'negative': float(probs[0]),
-                        'neutral': float(probs[1]),
-                        'positive': float(probs[2])
-                    }
+            import torch
+            import torch.nn.functional as F
+            
+            # Tokenize text
+            inputs = self.finbert_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            
+            # Move to same device as model
+            inputs = {k: v.to(self.finbert_model.device) for k, v in inputs.items()}
+            
+            # Get sentiment prediction
+            with torch.no_grad():
+                outputs = self.finbert_model(**inputs)
+                logits = outputs.logits
+                probabilities = F.softmax(logits, dim=1)
+            
+            # Convert to numpy
+            probabilities = probabilities.cpu().numpy()[0]
+            
+            # KO-finbert has 3 classes: negative (0), neutral (1), positive (2)
+            sentiment_score = (probabilities[2] - probabilities[0])  # Range: -1 to 1
+            
+            # Get predicted class
+            predicted_class = np.argmax(probabilities)
+            sentiment_label = ['negative', 'neutral', 'positive'][predicted_class]
+            
+            # Get confidence
+            confidence = probabilities[predicted_class]
+            
+            return {
+                'sentiment_score': float(sentiment_score),
+                'sentiment_label': sentiment_label,
+                'confidence': float(confidence),
+                'probabilities': {
+                    'negative': float(probabilities[0]),
+                    'neutral': float(probabilities[1]),
+                    'positive': float(probabilities[2])
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error in KO-finbert sentiment analysis: {str(e)}")
+            # Fall back to simple sentiment analysis
+            return self._analyze_sentiment_simple(text)
+    
+    def _analyze_sentiment_simple(self, text: str) -> Dict[str, Any]:
+        """
+        Analyze sentiment using simple keyword-based approach.
+        
+        Args:
+            text: Text to analyze
+            
+        Returns:
+            Dictionary with sentiment analysis results
+        """
+        positive_words = ['상승', '급등', '호조', '성장', '개선', '흑자', '최대', '신기록']
+        negative_words = ['하락', '급락', '부진', '감소', '악화', '적자', '손실', '하향']
+        
+        if not isinstance(text, str):
+            return {
+                'sentiment_score': 0.0,
+                'sentiment_label': 'neutral',
+                'confidence': 1.0,
+                'probabilities': {
+                    'negative': 0.0,
+                    'neutral': 1.0,
+                    'positive': 0.0
+                }
+            }
+        
+        pos_count = sum(1 for word in positive_words if word in text)
+        neg_count = sum(1 for word in negative_words if word in text)
+        
+        if pos_count + neg_count == 0:
+            sentiment_score = 0.0
+            sentiment_label = 'neutral'
+            confidence = 0.7  # Lower confidence for keyword-based approach
+            probabilities = {'negative': 0.15, 'neutral': 0.7, 'positive': 0.15}
+        else:
+            sentiment_score = (pos_count - neg_count) / (pos_count + neg_count)
+            
+            if sentiment_score > 0.2:
+                sentiment_label = 'positive'
+                confidence = 0.5 + (sentiment_score * 0.3)  # Range: 0.5 to 0.8
+                probabilities = {
+                    'negative': 0.1,
+                    'neutral': 0.9 - confidence,
+                    'positive': confidence
+                }
+            elif sentiment_score < -0.2:
+                sentiment_label = 'negative'
+                confidence = 0.5 + (abs(sentiment_score) * 0.3)  # Range: 0.5 to 0.8
+                probabilities = {
+                    'negative': confidence,
+                    'neutral': 0.9 - confidence,
+                    'positive': 0.1
                 }
             else:
-                # Fallback to rule-based sentiment analysis
-                # Define positive and negative keywords
-                positive_keywords = [
-                    '상승', '급등', '호조', '성장', '개선', '흑자', '최대', '신기록', '돌파',
-                    '매출 증가', '이익 증가', '실적 개선', '호실적', '기대', '전망', '성공',
-                    '계약', '수주', '인수', '합병', '협력', '파트너십', '출시', '개발 성공'
-                ]
-                
-                negative_keywords = [
-                    '하락', '급락', '부진', '감소', '악화', '적자', '손실', '하향', '부담',
-                    '매출 감소', '이익 감소', '실적 악화', '저조', '우려', '리스크', '실패',
-                    '소송', '제재', '벌금', '파산', '구조조정', '감원', '철수', '중단'
-                ]
-                
-                # Count positive and negative keywords
-                positive_count = sum(1 for keyword in positive_keywords if keyword in text)
-                negative_count = sum(1 for keyword in negative_keywords if keyword in text)
-                
-                # Calculate sentiment score
-                total_count = positive_count + negative_count
-                if total_count > 0:
-                    sentiment_score = (positive_count - negative_count) / total_count
-                else:
-                    sentiment_score = 0.0
-                
-                # Determine sentiment label
-                if sentiment_score > 0.2:
-                    sentiment_label = 'positive'
-                elif sentiment_score < -0.2:
-                    sentiment_label = 'negative'
-                else:
-                    sentiment_label = 'neutral'
-                
-                # Calculate confidence
-                confidence = abs(sentiment_score) if total_count > 0 else 0.0
-                
-                result = {
-                    'score': sentiment_score,
-                    'label': sentiment_label,
-                    'confidence': confidence,
-                    'keyword_counts': {
-                        'positive': positive_count,
-                        'negative': negative_count
-                    }
+                sentiment_label = 'neutral'
+                confidence = 0.6
+                probabilities = {
+                    'negative': (0.4 - (sentiment_score * 0.5)) / 2,
+                    'neutral': 0.6,
+                    'positive': (0.4 + (sentiment_score * 0.5)) / 2
                 }
-            
-            # Cache result
-            if self.cache_embeddings:
-                self.sentiment_cache[text] = result
-            
-            return result
-        except Exception as e:
-            logger.error(f"Error analyzing sentiment: {str(e)}")
-            return {'score': 0.0, 'label': 'neutral', 'confidence': 0.0}
+        
+        return {
+            'sentiment_score': sentiment_score,
+            'sentiment_label': sentiment_label,
+            'confidence': confidence,
+            'probabilities': probabilities
+        }
     
-    def get_embedding(self, text: str, model: str = 'default') -> np.ndarray:
+    def _extract_financial_entities(self, text: str) -> List[Dict[str, Any]]:
         """
-        Get embedding vector for Korean text.
+        Extract financial entities from text.
         
         Args:
-            text: Text to embed
-            model: Model to use ('kobert', 'openai', or 'default')
+            text: Text to analyze
             
         Returns:
-            Embedding vector as numpy array
+            List of financial entities
         """
-        if not text or not isinstance(text, str):
-            # Return zero vector of appropriate size
-            if model == 'openai':
-                return np.zeros(1536)  # OpenAI embeddings are 1536-dimensional
-            else:
-                return np.zeros(768)  # BERT embeddings are 768-dimensional
+        # Simple financial entity extraction
+        companies = ['삼성전자', 'SK하이닉스', 'LG전자', '현대자동차', '카카오', '네이버']
+        financial_terms = ['실적', '매출', '영업이익', '순이익', '주가', '시장', '투자']
         
-        # Create cache key
-        cache_key = f"{model}:{text}"
+        entities = []
         
-        # Check cache
-        if cache_key in self.embedding_cache:
-            return self.embedding_cache[cache_key]
+        # Extract companies
+        for company in companies:
+            if company in text:
+                entities.append({
+                    'type': 'company',
+                    'name': company,
+                    'position': text.find(company)
+                })
         
-        try:
-            # Determine which model to use
-            if model == 'openai' and self.use_openai:
-                embedding = self._get_openai_embedding(text)
-            elif model == 'kobert' and self.use_kobert:
-                embedding = self._get_kobert_embedding(text)
-            elif self.use_kobert:
-                embedding = self._get_kobert_embedding(text)
-            elif self.use_openai:
-                embedding = self._get_openai_embedding(text)
-            else:
-                # Fallback to simple TF-IDF like embedding
-                embedding = self._get_simple_embedding(text)
-            
-            # Cache embedding
-            if self.cache_embeddings:
-                self.embedding_cache[cache_key] = embedding
-            
-            return embedding
-        except Exception as e:
-            logger.error(f"Error getting embedding: {str(e)}")
-            
-            # Return zero vector of appropriate size
-            if model == 'openai':
-                return np.zeros(1536)
-            else:
-                return np.zeros(768)
+        # Extract financial terms
+        for term in financial_terms:
+            if term in text:
+                entities.append({
+                    'type': 'financial_term',
+                    'name': term,
+                    'position': text.find(term)
+                })
+        
+        # Sort by position
+        entities.sort(key=lambda x: x['position'])
+        
+        return entities
     
-    def _get_kobert_embedding(self, text: str) -> np.ndarray:
+    def analyze_texts_batch(self, texts: List[str], show_progress: bool = False) -> List[Dict[str, Any]]:
         """
-        Get embedding using KoBERT model.
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            Embedding vector as numpy array
-        """
-        import torch
-        
-        # Tokenize text
-        inputs = self.kobert_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-        
-        # Move to same device as model
-        if self.device == 'cuda' and torch.cuda.is_available():
-            inputs = {k: v.to('cuda') for k, v in inputs.items()}
-        
-        # Get embeddings
-        with torch.no_grad():
-            outputs = self.kobert_model(**inputs)
-            
-            # Use CLS token embedding (first token)
-            embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()[0]
-        
-        return embedding
-    
-    def _get_openai_embedding(self, text: str) -> np.ndarray:
-        """
-        Get embedding using OpenAI API.
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            Embedding vector as numpy array
-        """
-        try:
-            import openai
-            
-            # Set API key
-            openai.api_key = self.openai_api_key
-            
-            # Get embedding
-            response = openai.Embedding.create(
-                input=text,
-                model="text-embedding-ada-002"
-            )
-            
-            # Extract embedding
-            embedding = np.array(response['data'][0]['embedding'])
-            
-            return embedding
-        except Exception as e:
-            logger.error(f"Error getting OpenAI embedding: {str(e)}")
-            logger.warning("Falling back to simple embedding")
-            return self._get_simple_embedding(text)
-    
-    def _get_simple_embedding(self, text: str) -> np.ndarray:
-        """
-        Get simple TF-IDF like embedding for Korean text.
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            Embedding vector as numpy array
-        """
-        try:
-            # Try to use scikit-learn if available
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            
-            # Create vectorizer
-            vectorizer = TfidfVectorizer(max_features=768)
-            
-            # Fit and transform
-            X = vectorizer.fit_transform([text])
-            
-            # Convert to dense array
-            embedding = X.toarray()[0]
-            
-            # Pad or truncate to 768 dimensions
-            if len(embedding) < 768:
-                embedding = np.pad(embedding, (0, 768 - len(embedding)))
-            elif len(embedding) > 768:
-                embedding = embedding[:768]
-            
-            return embedding
-        except Exception as e:
-            logger.error(f"Error creating simple embedding: {str(e)}")
-            
-            # Even simpler fallback - character frequency
-            char_counts = {}
-            for char in text:
-                char_counts[char] = char_counts.get(char, 0) + 1
-            
-            # Create embedding from character frequencies
-            embedding = np.zeros(768)
-            for i, (char, count) in enumerate(char_counts.items()):
-                if i >= 768:
-                    break
-                embedding[i] = count / len(text)
-            
-            return embedding
-    
-    def analyze_text_batch(self, texts: List[str]) -> List[Dict[str, Any]]:
-        """
-        Analyze a batch of Korean financial texts.
+        Analyze a batch of texts.
         
         Args:
             texts: List of texts to analyze
+            show_progress: Whether to show progress bar
             
         Returns:
-            List of dictionaries with analysis results
+            List of analysis results
         """
         results = []
         
-        for text in texts:
-            # Get sentiment
-            sentiment = self.analyze_sentiment(text)
-            
-            # Get embedding
-            embedding = self.get_embedding(text)
-            
-            # Combine results
-            result = {
-                'sentiment': sentiment,
-                'embedding': embedding.tolist(),  # Convert to list for JSON serialization
-                'text_length': len(text)
-            }
-            
-            results.append(result)
+        iterator = texts
+        if show_progress:
+            iterator = tqdm(texts, desc="Analyzing texts")
+        
+        for text in iterator:
+            results.append(self.analyze_text(text))
         
         return results
     
-    def analyze_dataframe(self, df: pd.DataFrame, 
-                        text_col: str = 'Title',
-                        content_col: str = 'Body',
-                        use_content: bool = False) -> pd.DataFrame:
+    def analyze_dataframe(self, df: pd.DataFrame, text_col: str, result_prefix: str = 'sentiment_', 
+                        show_progress: bool = False) -> pd.DataFrame:
         """
-        Analyze texts in a DataFrame.
+        Analyze texts in a dataframe.
         
         Args:
-            df: DataFrame containing texts
-            text_col: Column name for primary text (e.g., title)
-            content_col: Column name for secondary text (e.g., body)
-            use_content: Whether to use content for analysis
+            df: Dataframe with texts
+            text_col: Column name for texts
+            result_prefix: Prefix for result columns
+            show_progress: Whether to show progress bar
             
         Returns:
-            DataFrame with analysis results
+            Dataframe with analysis results
         """
-        if len(df) == 0:
-            logger.warning("Empty DataFrame provided for analysis")
-            return df
-            
-        logger.info(f"Analyzing {len(df)} texts")
+        # Copy dataframe to avoid modifying original
+        result_df = df.copy()
         
-        try:
-            # Create a copy to avoid modifying the original
-            result_df = df.copy()
-            
-            # Initialize columns
-            result_df['sentiment_score'] = None
-            result_df['sentiment_label'] = None
-            result_df['sentiment_confidence'] = None
-            
-            # Process each row
-            for idx, row in result_df.iterrows():
-                # Determine text to analyze
-                if text_col in row and isinstance(row[text_col], str):
-                    text = row[text_col]
-                    
-                    # Add content if specified
-                    if use_content and content_col in row and isinstance(row[content_col], str):
-                        # Use first 512 characters of content
-                        text += " " + row[content_col][:512]
-                else:
-                    # Skip if no text
-                    continue
-                
-                # Analyze sentiment
-                sentiment = self.analyze_sentiment(text)
-                
-                # Store results
-                result_df.at[idx, 'sentiment_score'] = sentiment['score']
-                result_df.at[idx, 'sentiment_label'] = sentiment['label']
-                result_df.at[idx, 'sentiment_confidence'] = sentiment['confidence']
-            
-            # Save cache
-            self._save_cache()
-            
-            logger.info(f"Completed analysis for {len(result_df)} texts")
-            
-            return result_df
-        except Exception as e:
-            logger.error(f"Error analyzing DataFrame: {str(e)}")
-            return df
+        # Analyze texts
+        texts = df[text_col].tolist()
+        results = self.analyze_texts_batch(texts, show_progress)
+        
+        # Add results to dataframe
+        result_df[f'{result_prefix}score'] = [r['sentiment_score'] for r in results]
+        result_df[f'{result_prefix}label'] = [r['sentiment_label'] for r in results]
+        result_df[f'{result_prefix}confidence'] = [r['confidence'] for r in results]
+        
+        return result_df
     
-    def visualize_sentiment_distribution(self, df: pd.DataFrame, 
-                                       save_path: Optional[str] = None) -> None:
+    def visualize_sentiment_distribution(self, df: pd.DataFrame, label_col: str = 'sentiment_label', 
+                                       title: str = "Sentiment Distribution"):
         """
-        Visualize sentiment distribution.
+        Visualize sentiment distribution in a dataframe.
         
         Args:
-            df: DataFrame with sentiment analysis results
-            save_path: Path to save the visualization
+            df: Dataframe with sentiment labels
+            label_col: Column name for sentiment labels
+            title: Plot title
         """
-        if 'sentiment_label' not in df.columns or df['sentiment_label'].isna().all():
-            logger.warning("No sentiment labels available for visualization")
-            return
-            
-        try:
-            # Count sentiment labels
-            sentiment_counts = df['sentiment_label'].value_counts()
-            
-            # Create figure
-            plt.figure(figsize=(10, 6))
-            
-            # Create bar plot
-            ax = sns.barplot(x=sentiment_counts.index, y=sentiment_counts.values)
-            
-            # Add value labels
-            for i, v in enumerate(sentiment_counts.values):
-                ax.text(i, v + 0.1, str(v), ha='center')
-            
-            plt.title('Sentiment Distribution')
-            plt.xlabel('Sentiment')
-            plt.ylabel('Count')
-            
-            # Save or show
-            if save_path:
-                plt.savefig(save_path)
-                logger.info(f"Saved sentiment distribution visualization to {save_path}")
-            else:
-                plt.show()
-                
-        except Exception as e:
-            logger.error(f"Error visualizing sentiment distribution: {str(e)}")
+        plt.figure(figsize=(10, 6))
+        sns.countplot(x=label_col, data=df, order=['negative', 'neutral', 'positive'])
+        plt.title(title)
+        plt.xlabel('Sentiment')
+        plt.ylabel('Count')
+        plt.tight_layout()
+        plt.show()
     
-    def visualize_sentiment_over_time(self, df: pd.DataFrame, 
-                                    date_col: str = 'Date',
-                                    save_path: Optional[str] = None) -> None:
+    def visualize_sentiment_scores(self, df: pd.DataFrame, score_col: str = 'sentiment_score', 
+                                 text_col: str = None, title: str = "Sentiment Scores"):
         """
-        Visualize sentiment trends over time.
+        Visualize sentiment scores in a dataframe.
         
         Args:
-            df: DataFrame with sentiment analysis results
-            date_col: Column name for dates
-            save_path: Path to save the visualization
+            df: Dataframe with sentiment scores
+            score_col: Column name for sentiment scores
+            text_col: Column name for text labels (optional)
+            title: Plot title
         """
-        if ('sentiment_score' not in df.columns or df['sentiment_score'].isna().all() or
-            date_col not in df.columns):
-            logger.warning("No sentiment scores or dates available for visualization")
-            return
-            
-        try:
-            # Ensure date is datetime
-            if not pd.api.types.is_datetime64_any_dtype(df[date_col]):
-                df[date_col] = pd.to_datetime(df[date_col])
-            
-            # Group by date and calculate average sentiment
-            daily_sentiment = df.groupby(df[date_col].dt.date)['sentiment_score'].mean().reset_index()
-            
-            # Create figure
-            plt.figure(figsize=(12, 6))
-            
-            # Create line plot
-            plt.plot(daily_sentiment[date_col], daily_sentiment['sentiment_score'], marker='o')
-            
-            # Add horizontal line at zero
-            plt.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
-            
-            # Add trend line
-            try:
-                from scipy import stats
-                
-                # Calculate trend line
-                slope, intercept, r_value, p_value, std_err = stats.linregress(
-                    range(len(daily_sentiment)), daily_sentiment['sentiment_score']
-                )
-                
-                # Plot trend line
-                trend_x = np.array([0, len(daily_sentiment) - 1])
-                trend_y = slope * trend_x + intercept
-                
-                plt.plot(daily_sentiment[date_col].iloc[trend_x], trend_y, 'r--', alpha=0.7)
-                
-                # Add trend info
-                trend_direction = "Improving" if slope > 0 else "Declining"
-                plt.text(
-                    0.02, 0.02, 
-                    f"Trend: {trend_direction} (slope: {slope:.4f})", 
-                    transform=plt.gca().transAxes
-                )
-            except Exception as e:
-                logger.warning(f"Could not calculate trend line: {str(e)}")
-            
-            plt.title('Sentiment Trend Over Time')
-            plt.xlabel('Date')
-            plt.ylabel('Average Sentiment Score (-1 to 1)')
-            plt.grid(True, alpha=0.3)
-            
-            # Format x-axis dates
-            plt.gcf().autofmt_xdate()
-            
-            # Save or show
-            if save_path:
-                plt.savefig(save_path)
-                logger.info(f"Saved sentiment trend visualization to {save_path}")
-            else:
-                plt.show()
-                
-        except Exception as e:
-            logger.error(f"Error visualizing sentiment trend: {str(e)}")
-    
-    def compare_sentiment_by_source(self, df: pd.DataFrame, 
-                                  source_col: str = 'Press',
-                                  save_path: Optional[str] = None) -> None:
-        """
-        Compare sentiment distribution by news source.
+        plt.figure(figsize=(12, 6))
         
-        Args:
-            df: DataFrame with sentiment analysis results
-            source_col: Column name for news sources
-            save_path: Path to save the visualization
-        """
-        if ('sentiment_score' not in df.columns or df['sentiment_score'].isna().all() or
-            source_col not in df.columns):
-            logger.warning("No sentiment scores or sources available for visualization")
-            return
-            
-        try:
-            # Group by source and calculate average sentiment
-            source_sentiment = df.groupby(source_col)['sentiment_score'].agg(['mean', 'count']).reset_index()
-            
-            # Sort by count (descending)
-            source_sentiment = source_sentiment.sort_values('count', ascending=False)
-            
-            # Take top 10 sources by count
-            top_sources = source_sentiment.head(10)
-            
-            # Create figure
-            plt.figure(figsize=(12, 6))
-            
-            # Create bar plot
-            bars = plt.bar(top_sources[source_col], top_sources['mean'])
-            
-            # Color bars by sentiment
-            for i, bar in enumerate(bars):
-                if top_sources['mean'].iloc[i] > 0:
-                    bar.set_color('green')
-                else:
-                    bar.set_color('red')
-            
-            # Add count labels
-            for i, v in enumerate(top_sources['count']):
-                plt.text(i, top_sources['mean'].iloc[i] + 0.02, f"n={v}", ha='center')
-            
-            plt.title('Average Sentiment by News Source')
-            plt.xlabel('News Source')
-            plt.ylabel('Average Sentiment Score (-1 to 1)')
-            plt.grid(True, alpha=0.3)
-            
-            # Add horizontal line at zero
-            plt.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
-            
-            # Rotate x-axis labels
+        if text_col is not None:
+            # Use text as labels
+            labels = df[text_col].apply(lambda x: x[:30] + "..." if len(x) > 30 else x)
+            plt.bar(labels, df[score_col])
             plt.xticks(rotation=45, ha='right')
-            
-            plt.tight_layout()
-            
-            # Save or show
-            if save_path:
-                plt.savefig(save_path)
-                logger.info(f"Saved source sentiment visualization to {save_path}")
-            else:
-                plt.show()
-                
-        except Exception as e:
-            logger.error(f"Error visualizing source sentiment: {str(e)}")
-    
-    def get_most_positive_negative(self, df: pd.DataFrame, 
-                                 top_n: int = 5) -> Dict[str, pd.DataFrame]:
-        """
-        Get most positive and negative texts.
+        else:
+            # Use indices as labels
+            plt.bar(range(len(df)), df[score_col])
+            plt.xticks(range(len(df)), [f"Text {i+1}" for i in range(len(df))])
         
-        Args:
-            df: DataFrame with sentiment analysis results
-            top_n: Number of texts to return
-            
-        Returns:
-            Dictionary with most positive and negative texts
-        """
-        if 'sentiment_score' not in df.columns or df['sentiment_score'].isna().all():
-            logger.warning("No sentiment scores available")
-            return {'positive': pd.DataFrame(), 'negative': pd.DataFrame()}
-            
-        try:
-            # Filter out rows without sentiment scores
-            filtered_df = df.dropna(subset=['sentiment_score'])
-            
-            if len(filtered_df) == 0:
-                logger.warning("No texts with sentiment scores")
-                return {'positive': pd.DataFrame(), 'negative': pd.DataFrame()}
-            
-            # Get most positive texts
-            positive_df = filtered_df.sort_values('sentiment_score', ascending=False).head(top_n)
-            
-            # Get most negative texts
-            negative_df = filtered_df.sort_values('sentiment_score', ascending=True).head(top_n)
-            
-            return {'positive': positive_df, 'negative': negative_df}
-        except Exception as e:
-            logger.error(f"Error getting most positive/negative texts: {str(e)}")
-            return {'positive': pd.DataFrame(), 'negative': pd.DataFrame()}
+        plt.axhline(y=0, color='r', linestyle='-', alpha=0.3)
+        plt.title(title)
+        plt.xlabel('Text')
+        plt.ylabel('Sentiment Score')
+        plt.tight_layout()
+        plt.show()
+"""
