@@ -36,18 +36,20 @@ class NewsVectorizer:
                  embedding_dim: int = 300,
                  use_gpu: bool = True,
                  title_weight: float = 2.0,
-                 models_dir: str = None):
+                 models_dir: str = None,
+                 korean_support: bool = True):
         """
         Initialize the news vectorizer.
         
         Args:
-            method: Vectorization method ('tfidf', 'word2vec', 'fasttext', 'openai')
+            method: Vectorization method ('tfidf', 'word2vec', 'fasttext', 'openai', 'kobert')
             max_features: Maximum number of features for TF-IDF
             ngram_range: Range of n-grams to consider
             embedding_dim: Dimension of embeddings for neural methods
             use_gpu: Whether to use GPU for neural methods
             title_weight: Weight multiplier for title vs. content
             models_dir: Directory to save/load models
+            korean_support: Whether to enable specific Korean language support
         """
         self.method = method.lower()
         self.max_features = max_features
@@ -55,6 +57,7 @@ class NewsVectorizer:
         self.embedding_dim = embedding_dim
         self.title_weight = title_weight
         self.models_dir = models_dir or os.path.join(os.getcwd(), "models", "vectorizers")
+        self.korean_support = korean_support
         
         # Create models directory if it doesn't exist
         os.makedirs(self.models_dir, exist_ok=True)
@@ -99,6 +102,23 @@ class NewsVectorizer:
                 logger.info("OpenAI API vectorization initialized")
             except ImportError:
                 logger.error("OpenAI package not installed, falling back to TF-IDF")
+                self.method = 'tfidf'
+                self._initialize_vectorizer()
+        
+        elif self.method == 'kobert':
+            try:
+                # We'll check if transformers is available but won't load the model yet
+                # to avoid disk space issues
+                import importlib.util
+                if importlib.util.find_spec("transformers") is not None:
+                    self.vectorizer = "kobert"
+                    logger.info("KoBERT vectorization initialized (model will be loaded on demand)")
+                else:
+                    logger.error("Transformers package not installed, falling back to TF-IDF")
+                    self.method = 'tfidf'
+                    self._initialize_vectorizer()
+            except Exception as e:
+                logger.error(f"Error initializing KoBERT: {str(e)}, falling back to TF-IDF")
                 self.method = 'tfidf'
                 self._initialize_vectorizer()
                 
@@ -217,10 +237,85 @@ class NewsVectorizer:
                 return vectors
                 
             elif self.method == 'openai':
-                # This would use the OpenAI API to get embeddings
-                # For now, we'll just return a placeholder
-                logger.warning("OpenAI embeddings not implemented, returning placeholder")
-                return np.zeros((len(texts), self.embedding_dim))
+                try:
+                    import openai
+                    # Check if API key is set
+                    if not openai.api_key:
+                        logger.warning("OpenAI API key not set, returning placeholder vectors")
+                        return np.zeros((len(texts), self.embedding_dim))
+                    
+                    # Get embeddings in batches to avoid API limits
+                    batch_size = 100
+                    all_embeddings = []
+                    
+                    for i in range(0, len(texts), batch_size):
+                        batch_texts = texts[i:i+batch_size]
+                        response = openai.Embedding.create(
+                            input=batch_texts,
+                            model="text-embedding-ada-002"
+                        )
+                        batch_embeddings = [item["embedding"] for item in response["data"]]
+                        all_embeddings.extend(batch_embeddings)
+                    
+                    vectors = np.array(all_embeddings)
+                    logger.info(f"Transformed {len(texts)} documents using OpenAI API to shape {vectors.shape}")
+                    return vectors
+                except Exception as e:
+                    logger.error(f"Error using OpenAI API: {str(e)}, returning placeholder")
+                    return np.zeros((len(texts), self.embedding_dim))
+            
+            elif self.method == 'kobert':
+                try:
+                    # Lazy load KoBERT to save memory
+                    from transformers import AutoTokenizer, AutoModel
+                    import torch
+                    
+                    # Load KoBERT tokenizer and model
+                    tokenizer = AutoTokenizer.from_pretrained("monologg/kobert")
+                    model = AutoModel.from_pretrained("monologg/kobert")
+                    
+                    if self.use_gpu and torch.cuda.is_available():
+                        model = model.cuda()
+                    
+                    # Process in batches to avoid memory issues
+                    batch_size = 8
+                    all_embeddings = []
+                    
+                    for i in range(0, len(texts), batch_size):
+                        batch_texts = texts[i:i+batch_size]
+                        
+                        # Tokenize
+                        encoded_input = tokenizer(
+                            batch_texts,
+                            padding=True,
+                            truncation=True,
+                            max_length=512,
+                            return_tensors='pt'
+                        )
+                        
+                        # Move to GPU if available
+                        if self.use_gpu and torch.cuda.is_available():
+                            encoded_input = {k: v.cuda() for k, v in encoded_input.items()}
+                        
+                        # Get embeddings
+                        with torch.no_grad():
+                            model_output = model(**encoded_input)
+                            
+                        # Use [CLS] token embedding as document representation
+                        sentence_embeddings = model_output[0][:, 0, :].cpu().numpy()
+                        all_embeddings.extend(sentence_embeddings)
+                    
+                    vectors = np.array(all_embeddings)
+                    logger.info(f"Transformed {len(texts)} documents using KoBERT to shape {vectors.shape}")
+                    return vectors
+                    
+                except Exception as e:
+                    logger.error(f"Error using KoBERT: {str(e)}, falling back to TF-IDF")
+                    # Temporarily switch to TF-IDF for this transformation
+                    temp_vectorizer = TfidfVectorizer(max_features=self.max_features)
+                    temp_vectorizer.fit(texts)
+                    vectors = temp_vectorizer.transform(texts)
+                    return vectors
                 
             else:
                 logger.error(f"Unknown method: {self.method}")
@@ -286,7 +381,8 @@ class NewsVectorizer:
                           tokenized_title_col: str = None,
                           combine_title_content: bool = True,
                           reduce_dims: bool = False,
-                          n_components: int = 100) -> pd.DataFrame:
+                          n_components: int = 100,
+                          title_content_ratio: float = None) -> pd.DataFrame:
         """
         Vectorize a DataFrame of news articles.
         
@@ -299,6 +395,7 @@ class NewsVectorizer:
             combine_title_content: Whether to combine title and content with title weighting
             reduce_dims: Whether to reduce dimensions
             n_components: Number of components if reducing dimensions
+            title_content_ratio: Optional ratio to weight title vs content (overrides title_weight)
             
         Returns:
             DataFrame with added vector representations
@@ -313,22 +410,47 @@ class NewsVectorizer:
         df = articles_df.copy()
         
         try:
+            # Use provided title_content_ratio if specified
+            title_weight = title_content_ratio if title_content_ratio is not None else self.title_weight
+            
             # Prepare texts for vectorization
             if combine_title_content and title_col in df.columns and content_col in df.columns:
                 # Combine title and content with title having more weight
                 combined_texts = []
+                title_only_texts = []
+                content_only_texts = []
                 
                 for _, row in df.iterrows():
                     title = row.get(title_col, "")
                     content = row.get(content_col, "")
                     
+                    # Store separate title and content for potential separate vectorization
+                    title_only_texts.append(title)
+                    content_only_texts.append(content)
+                    
                     # Weight title by repeating it
-                    title_part = " ".join([title] * int(self.title_weight))
+                    title_part = " ".join([title] * int(title_weight))
                     combined_text = f"{title_part} {content}"
                     combined_texts.append(combined_text)
                 
                 texts_to_vectorize = combined_texts
-                logger.info(f"Combined {title_col} and {content_col} with title weight {self.title_weight}")
+                logger.info(f"Combined {title_col} and {content_col} with title weight {title_weight}")
+                
+                # Store separate vectors for title and content if requested
+                if title_content_ratio is not None:
+                    # Vectorize title and content separately
+                    title_vectors = self.transform(title_only_texts)
+                    content_vectors = self.transform(content_only_texts)
+                    
+                    # Store separate vectors
+                    if self.method == 'tfidf':
+                        df['title_vector'] = list(title_vectors.toarray())
+                        df['content_vector'] = list(content_vectors.toarray())
+                    else:
+                        df['title_vector'] = list(title_vectors)
+                        df['content_vector'] = list(content_vectors)
+                    
+                    logger.info(f"Created separate vectors for title and content")
             else:
                 # Use only content
                 if content_col in df.columns:
@@ -399,115 +521,128 @@ class NewsVectorizer:
             except Exception as e:
                 logger.error(f"Error getting top terms: {str(e)}")
                 return {}
-        
-        elif self.method in ['word2vec', 'fasttext']:
-            if not self.vectorizer:
-                logger.warning(f"{self.method} model not fitted yet")
-                return {}
-                
-            try:
-                # Get most frequent words and their vectors
-                vocab = self.vectorizer.wv.key_to_index
-                top_words = sorted(vocab.items(), key=lambda x: x[1])[:n]
-                
-                # Create a dictionary of word -> vector norm (as importance)
-                top_terms = {}
-                for word, idx in top_words:
-                    vector = self.vectorizer.wv[word]
-                    importance = np.linalg.norm(vector)
-                    top_terms[word] = importance
-                
-                return top_terms
-            except Exception as e:
-                logger.error(f"Error getting top terms: {str(e)}")
-                return {}
-        
         else:
             logger.warning(f"get_top_terms not implemented for {self.method}")
             return {}
     
     def _save_model(self) -> None:
         """
-        Save the fitted vectorizer model.
+        Save the vectorizer model to disk.
         """
         try:
-            model_path = os.path.join(self.models_dir, f"{self.method}_vectorizer.joblib")
-            
             if self.method == 'tfidf':
+                model_path = os.path.join(self.models_dir, "tfidf_vectorizer.joblib")
                 joblib.dump(self.vectorizer, model_path)
+                logger.info(f"Saved TF-IDF vectorizer to {model_path}")
+                
             elif self.method in ['word2vec', 'fasttext']:
+                model_path = os.path.join(self.models_dir, f"{self.method}_model.bin")
                 self.vectorizer.save(model_path)
-            
-            logger.info(f"Saved {self.method} vectorizer model to {model_path}")
+                logger.info(f"Saved {self.method} model to {model_path}")
+                
         except Exception as e:
-            logger.error(f"Error saving vectorizer model: {str(e)}")
+            logger.error(f"Error saving model: {str(e)}")
     
     def load_model(self, model_path: str = None) -> bool:
         """
-        Load a previously saved vectorizer model.
+        Load a saved vectorizer model.
         
         Args:
-            model_path: Path to the saved model
+            model_path: Path to the model file (if None, uses default path)
             
         Returns:
             True if successful, False otherwise
         """
-        if model_path is None:
-            model_path = os.path.join(self.models_dir, f"{self.method}_vectorizer.joblib")
-            
         try:
-            if os.path.exists(model_path):
+            if model_path is None:
                 if self.method == 'tfidf':
-                    self.vectorizer = joblib.load(model_path)
-                elif self.method == 'word2vec':
-                    self.vectorizer = Word2Vec.load(model_path)
-                elif self.method == 'fasttext':
-                    self.vectorizer = FastText.load(model_path)
-                
-                logger.info(f"Loaded {self.method} vectorizer model from {model_path}")
-                
-                # Also load SVD model if it exists
-                svd_path = os.path.join(self.models_dir, f"{self.method}_svd_model.joblib")
-                if os.path.exists(svd_path):
-                    self.svd = joblib.load(svd_path)
-                    logger.info(f"Loaded SVD model from {svd_path}")
-                
-                return True
-            else:
-                logger.warning(f"Model file not found at {model_path}")
+                    model_path = os.path.join(self.models_dir, "tfidf_vectorizer.joblib")
+                elif self.method in ['word2vec', 'fasttext']:
+                    model_path = os.path.join(self.models_dir, f"{self.method}_model.bin")
+                else:
+                    logger.error(f"No default path for method: {self.method}")
+                    return False
+            
+            if not os.path.exists(model_path):
+                logger.error(f"Model file not found: {model_path}")
                 return False
+                
+            if self.method == 'tfidf':
+                self.vectorizer = joblib.load(model_path)
+                logger.info(f"Loaded TF-IDF vectorizer from {model_path}")
+                
+            elif self.method == 'word2vec':
+                from gensim.models import Word2Vec
+                self.vectorizer = Word2Vec.load(model_path)
+                logger.info(f"Loaded Word2Vec model from {model_path}")
+                
+            elif self.method == 'fasttext':
+                from gensim.models import FastText
+                self.vectorizer = FastText.load(model_path)
+                logger.info(f"Loaded FastText model from {model_path}")
+                
+            # Load SVD model if it exists
+            svd_path = os.path.join(self.models_dir, f"{self.method}_svd_model.joblib")
+            if os.path.exists(svd_path):
+                self.svd = joblib.load(svd_path)
+                logger.info(f"Loaded SVD model from {svd_path}")
+                
+            return True
         except Exception as e:
             logger.error(f"Error loading model: {str(e)}")
             return False
-
-
-# Example usage
-if __name__ == "__main__":
-    # Sample articles
-    sample_articles = [
-        "삼성전자가 반도체 패키징 역량 강화를 위해 영입한 대만 TSMC 출신 베테랑 엔지니어 린준청 부사장이 회사를 떠났다.",
-        "SK하이닉스는 인공지능 반도체 시장 공략을 위한 HBM 생산 확대에 나선다.",
-        "LG전자가 올레드 TV 신제품을 출시하며 프리미엄 TV 시장 공략을 강화한다.",
-        "현대자동차는 전기차 판매 호조에 힘입어 분기 실적이 시장 예상치를 상회했다.",
-        "카카오는 인공지능 기술 강화를 위해 연구개발 투자를 확대한다고 밝혔다."
-    ]
     
-    # Create a DataFrame
-    df = pd.DataFrame({
-        'title': sample_articles,
-        'processed_title': sample_articles,
-        'processed_content': sample_articles
-    })
+    def calculate_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
+        """
+        Calculate cosine similarity between two vectors.
+        
+        Args:
+            vec1: First vector
+            vec2: Second vector
+            
+        Returns:
+            Cosine similarity score
+        """
+        try:
+            # Convert to numpy arrays if not already
+            if isinstance(vec1, list):
+                vec1 = np.array(vec1)
+            if isinstance(vec2, list):
+                vec2 = np.array(vec2)
+                
+            # Calculate cosine similarity
+            norm1 = np.linalg.norm(vec1)
+            norm2 = np.linalg.norm(vec2)
+            
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+                
+            return np.dot(vec1, vec2) / (norm1 * norm2)
+        except Exception as e:
+            logger.error(f"Error calculating similarity: {str(e)}")
+            return 0.0
     
-    # Create a vectorizer and vectorize articles
-    vectorizer = NewsVectorizer(method='tfidf', max_features=100)
-    vectorized_df = vectorizer.vectorize_articles(df, reduce_dims=True, n_components=5)
-    
-    print(f"Vectorized DataFrame shape: {vectorized_df.shape}")
-    print(f"First vector: {vectorized_df['vector'].iloc[0]}")
-    
-    # Get top terms
-    top_terms = vectorizer.get_top_terms(5)
-    print("Top terms:")
-    for term, value in top_terms.items():
-        print(f"  {term}: {value:.4f}")
+    def calculate_similarity_matrix(self, vectors: List[np.ndarray]) -> np.ndarray:
+        """
+        Calculate pairwise cosine similarity matrix for a list of vectors.
+        
+        Args:
+            vectors: List of vectors
+            
+        Returns:
+            Similarity matrix
+        """
+        try:
+            n = len(vectors)
+            similarity_matrix = np.zeros((n, n))
+            
+            for i in range(n):
+                for j in range(i, n):
+                    sim = self.calculate_similarity(vectors[i], vectors[j])
+                    similarity_matrix[i, j] = sim
+                    similarity_matrix[j, i] = sim  # Symmetric
+                    
+            return similarity_matrix
+        except Exception as e:
+            logger.error(f"Error calculating similarity matrix: {str(e)}")
+            return np.array([])

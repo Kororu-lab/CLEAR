@@ -36,7 +36,9 @@ class StockImpactAnalyzer:
                  time_windows: List[Dict[str, Any]] = None,
                  impact_thresholds: Dict[str, float] = None,
                  use_gpu: bool = True,
-                 models_dir: str = None):
+                 models_dir: str = None,
+                 use_market_hours: bool = True,
+                 company_ticker_map: Dict[str, str] = None):
         """
         Initialize the stock impact analyzer.
         
@@ -45,12 +47,14 @@ class StockImpactAnalyzer:
             impact_thresholds: Thresholds for impact categorization
             use_gpu: Whether to use GPU for neural network models
             models_dir: Directory to save/load models
+            use_market_hours: Whether to consider market opening/closing hours
+            company_ticker_map: Mapping of company names to ticker symbols
         """
         # Default time windows
         self.time_windows = time_windows or [
-            {"name": "immediate", "hours": 1},
-            {"name": "short_term", "hours": 24},
-            {"name": "medium_term", "days": 3}
+            {"name": "immediate", "days": 1},  # Changed from hours to days to match stock data format
+            {"name": "short_term", "days": 3},
+            {"name": "medium_term", "days": 7}
         ]
         
         # Default impact thresholds
@@ -73,6 +77,23 @@ class StockImpactAnalyzer:
         # Initialize impact prediction model
         self.impact_model = None
         self.impact_model_type = None
+        
+        # Use market hours for analysis
+        self.use_market_hours = use_market_hours
+        
+        # Default company to ticker mapping
+        self.company_ticker_map = company_ticker_map or {
+            "삼성전자": "005930",
+            "SK하이닉스": "000660",
+            "LG전자": "066570",
+            "현대자동차": "005380",
+            "NAVER": "035420",
+            "카카오": "035720",
+            "셀트리온": "068270",
+            "삼성바이오로직스": "207940",
+            "기아": "000270",
+            "POSCO홀딩스": "005490"
+        }
         
         logger.info(f"Initialized StockImpactAnalyzer with {len(self.time_windows)} time windows")
     
@@ -109,6 +130,7 @@ class StockImpactAnalyzer:
                 df[f'impact_{window_name}'] = np.nan
                 df[f'price_change_{window_name}'] = np.nan
                 df[f'volume_change_{window_name}'] = np.nan
+                df[f'volatility_{window_name}'] = np.nan  # Added volatility metric
             
             # Calculate impact for each article
             for idx, row in df.iterrows():
@@ -137,11 +159,10 @@ class StockImpactAnalyzer:
                     # Calculate impact for each time window
                     for window in self.time_windows:
                         window_name = window['name']
-                        window_hours = window.get('hours', 0)
                         window_days = window.get('days', 0)
                         
                         # Calculate time delta
-                        time_delta = timedelta(hours=window_hours, days=window_days)
+                        time_delta = timedelta(days=window_days)
                         
                         # Calculate impact
                         impact_data = self._calculate_impact(
@@ -163,322 +184,362 @@ class StockImpactAnalyzer:
                         price_changes = [data['price_change'] for data in ticker_impacts[window_name]]
                         volume_changes = [data['volume_change'] for data in ticker_impacts[window_name]]
                         
+                        # Calculate volatility (high-low range)
+                        volatilities = [data.get('volatility', 0) for data in ticker_impacts[window_name] if 'volatility' in data]
+                        
                         avg_price_change = np.mean(price_changes)
                         avg_volume_change = np.mean(volume_changes)
+                        avg_volatility = np.mean(volatilities) if volatilities else 0
                         
                         # Calculate impact score (-5 to +5 scale)
-                        impact_score = self._calculate_impact_score(avg_price_change, avg_volume_change)
+                        impact_score = self._calculate_impact_score(avg_price_change, avg_volume_change, avg_volatility)
                         
                         # Store in DataFrame
                         df.at[idx, f'impact_{window_name}'] = impact_score
                         df.at[idx, f'price_change_{window_name}'] = avg_price_change
                         df.at[idx, f'volume_change_{window_name}'] = avg_volume_change
+                        df.at[idx, f'volatility_{window_name}'] = avg_volatility
             
-            # Calculate overall impact score (weighted average of time windows)
-            df['impact_score'] = df.apply(
-                lambda row: self._calculate_overall_impact(row), axis=1
-            )
+            # Calculate overall impact
+            df['impact_overall'] = df.apply(self._calculate_overall_impact, axis=1)
             
-            logger.info(f"Completed impact analysis for {len(df)} articles")
+            # Add sentiment analysis if available
+            if 'Emotion' in df.columns:
+                df['sentiment_score'] = df['Emotion'].apply(self._map_emotion_to_score)
+                
+                # Combine sentiment with impact
+                df['combined_score'] = df.apply(
+                    lambda x: self._combine_sentiment_and_impact(
+                        x['sentiment_score'] if pd.notna(x.get('sentiment_score')) else 0,
+                        x['impact_overall'] if pd.notna(x.get('impact_overall')) else 0
+                    ), 
+                    axis=1
+                )
             
-            # Save results
-            self._save_impact_results(df)
-            
+            logger.info(f"Impact analysis completed for {len(df)} articles")
             return df
+            
         except Exception as e:
-            logger.error(f"Error analyzing news impact: {str(e)}")
-            raise
+            logger.error(f"Error in impact analysis: {str(e)}")
+            return news_df
     
     def train_impact_model(self, news_df: pd.DataFrame, 
                           stock_data: Dict[str, pd.DataFrame],
                           model_type: str = 'random_forest',
-                          features: List[str] = None) -> None:
+                          features: List[str] = None,
+                          target: str = 'price_change_short_term',
+                          test_size: float = 0.2) -> Dict[str, Any]:
         """
-        Train a model to predict the impact of news on stock prices.
+        Train a model to predict stock price impact from news features.
         
         Args:
             news_df: DataFrame containing news articles with impact scores
             stock_data: Dictionary mapping tickers to stock price DataFrames
-            model_type: Type of model to train ('random_forest', 'linear', 'neural')
-            features: List of features to use for prediction
-        """
-        if len(news_df) == 0:
-            logger.warning("Empty DataFrame provided for model training")
-            return
-            
-        logger.info(f"Training {model_type} impact prediction model on {len(news_df)} articles")
-        
-        try:
-            # Default features if not provided
-            if features is None:
-                features = ['cluster_id', 'cluster_size']
-                
-                # Add vector features if available
-                if 'vector' in news_df.columns:
-                    # Extract vector components as features
-                    vector_df = pd.DataFrame(
-                        news_df['vector'].tolist(), 
-                        index=news_df.index
-                    )
-                    vector_df.columns = [f'vector_{i}' for i in range(vector_df.shape[1])]
-                    
-                    # Combine with original DataFrame
-                    train_df = pd.concat([news_df, vector_df], axis=1)
-                    
-                    # Add vector component names to features
-                    features.extend([f'vector_{i}' for i in range(vector_df.shape[1])])
-                else:
-                    train_df = news_df.copy()
-                    
-                # Add other available features
-                for col in ['cluster_topic', 'Press', 'Emotion']:
-                    if col in train_df.columns:
-                        # Convert categorical to one-hot
-                        one_hot = pd.get_dummies(train_df[col], prefix=col)
-                        train_df = pd.concat([train_df, one_hot], axis=1)
-                        features.extend(one_hot.columns.tolist())
-            else:
-                train_df = news_df.copy()
-            
-            # Filter out rows without impact scores
-            train_df = train_df.dropna(subset=['impact_score'])
-            
-            if len(train_df) < 10:
-                logger.warning("Not enough data for model training")
-                return
-            
-            # Prepare features and target
-            X = train_df[features].fillna(0)
-            y = train_df['impact_score']
-            
-            # Train model based on type
-            if model_type == 'random_forest':
-                self.impact_model = RandomForestRegressor(
-                    n_estimators=100,
-                    max_depth=10,
-                    random_state=42
-                )
-                self.impact_model.fit(X, y)
-                
-            elif model_type == 'linear':
-                self.impact_model = LinearRegression()
-                self.impact_model.fit(X, y)
-                
-            elif model_type == 'neural':
-                # Convert to PyTorch tensors
-                X_tensor = torch.tensor(X.values, dtype=torch.float32)
-                y_tensor = torch.tensor(y.values, dtype=torch.float32).view(-1, 1)
-                
-                # Create dataset and dataloader
-                dataset = TensorDataset(X_tensor, y_tensor)
-                dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-                
-                # Define neural network
-                input_size = X.shape[1]
-                self.impact_model = NeuralImpactModel(input_size)
-                
-                # Move to GPU if available
-                if self.use_gpu:
-                    self.impact_model = self.impact_model.cuda()
-                
-                # Train the model
-                self._train_neural_model(self.impact_model, dataloader)
-            
-            else:
-                logger.warning(f"Unknown model type: {model_type}, using random forest")
-                self.impact_model = RandomForestRegressor(
-                    n_estimators=100,
-                    max_depth=10,
-                    random_state=42
-                )
-                self.impact_model.fit(X, y)
-                model_type = 'random_forest'
-            
-            self.impact_model_type = model_type
-            self.model_features = features
-            
-            # Save the model
-            self._save_impact_model()
-            
-            logger.info(f"Trained {model_type} impact model with {len(features)} features")
-        except Exception as e:
-            logger.error(f"Error training impact model: {str(e)}")
-    
-    def predict_impact(self, articles_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Predict the impact of news articles on stock prices.
-        
-        Args:
-            articles_df: DataFrame containing news articles
+            model_type: Type of model to train ('linear', 'random_forest', 'neural')
+            features: List of feature columns to use
+            target: Target column to predict
+            test_size: Proportion of data to use for testing
             
         Returns:
-            DataFrame with predicted impact scores
+            Dictionary with training results
         """
-        if len(articles_df) == 0:
-            logger.warning("Empty DataFrame provided for impact prediction")
-            return articles_df
-            
-        if self.impact_model is None:
-            logger.warning("Impact model not trained, cannot predict")
-            return articles_df
-            
-        logger.info(f"Predicting impact for {len(articles_df)} articles")
+        logger.info(f"Training {model_type} model for impact prediction")
         
         try:
-            # Create a copy to avoid modifying the original
-            df = articles_df.copy()
+            # Analyze impact if not already done
+            if target not in news_df.columns:
+                news_df = self.analyze_news_impact(news_df, stock_data)
             
-            # Prepare features
-            if 'vector' in df.columns and any(f.startswith('vector_') for f in self.model_features):
-                # Extract vector components as features
-                vector_df = pd.DataFrame(
-                    df['vector'].tolist(), 
-                    index=df.index
-                )
-                vector_df.columns = [f'vector_{i}' for i in range(vector_df.shape[1])]
+            # Default features if not specified
+            if features is None:
+                features = ['sentiment_score', 'Num_comment']
                 
-                # Combine with original DataFrame
-                df = pd.concat([df, vector_df], axis=1)
+                # Add time window features if available
+                for window in self.time_windows:
+                    window_name = window['name']
+                    if f'impact_{window_name}' in news_df.columns:
+                        features.append(f'impact_{window_name}')
             
-            # Prepare one-hot features if needed
-            for col in ['cluster_topic', 'Press', 'Emotion']:
-                if col in df.columns and any(f.startswith(f'{col}_') for f in self.model_features):
-                    one_hot = pd.get_dummies(df[col], prefix=col)
-                    df = pd.concat([df, one_hot], axis=1)
+            # Filter rows with valid target values
+            valid_df = news_df.dropna(subset=[target])
             
-            # Select features and fill missing values
-            X = df[self.model_features].fillna(0)
+            if len(valid_df) < 10:
+                logger.warning(f"Insufficient data for training: {len(valid_df)} valid rows")
+                return {"success": False, "error": "Insufficient data for training"}
             
-            # Predict impact
-            if self.impact_model_type in ['random_forest', 'linear']:
-                df['predicted_impact'] = self.impact_model.predict(X)
+            # Prepare features and target
+            X = valid_df[features].fillna(0)
+            y = valid_df[target]
+            
+            # Train-test split
+            from sklearn.model_selection import train_test_split
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+            
+            # Train model based on type
+            if model_type == 'linear':
+                model = LinearRegression()
+                model.fit(X_train, y_train)
+                
+            elif model_type == 'random_forest':
+                model = RandomForestRegressor(n_estimators=100, random_state=42)
+                model.fit(X_train, y_train)
+                
+            elif model_type == 'neural':
+                # Simple neural network for regression
+                if self.use_gpu and torch.cuda.is_available():
+                    device = torch.device('cuda')
+                else:
+                    device = torch.device('cpu')
+                
+                # Convert to tensors
+                X_train_tensor = torch.FloatTensor(X_train.values).to(device)
+                y_train_tensor = torch.FloatTensor(y_train.values).to(device)
+                X_test_tensor = torch.FloatTensor(X_test.values).to(device)
+                y_test_tensor = torch.FloatTensor(y_test.values).to(device)
+                
+                # Create datasets and dataloaders
+                train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+                train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+                
+                # Define model
+                input_size = X_train.shape[1]
+                model = nn.Sequential(
+                    nn.Linear(input_size, 64),
+                    nn.ReLU(),
+                    nn.Linear(64, 32),
+                    nn.ReLU(),
+                    nn.Linear(32, 1)
+                ).to(device)
+                
+                # Train model
+                criterion = nn.MSELoss()
+                optimizer = optim.Adam(model.parameters(), lr=0.001)
+                
+                self._train_neural_model(model, train_loader, epochs=100)
+            
+            # Evaluate model
+            if model_type in ['linear', 'random_forest']:
+                train_score = model.score(X_train, y_train)
+                test_score = model.score(X_test, y_test)
+                
+                # Save model
+                model_path = os.path.join(self.models_dir, f"impact_{model_type}.joblib")
+                joblib.dump(model, model_path)
+                
+                self.impact_model = model
+                self.impact_model_type = model_type
+                
+                logger.info(f"Model trained and saved: Train R² = {train_score:.4f}, Test R² = {test_score:.4f}")
+                
+                return {
+                    "success": True,
+                    "model_type": model_type,
+                    "train_score": train_score,
+                    "test_score": test_score,
+                    "model_path": model_path,
+                    "features": features
+                }
+                
+            elif model_type == 'neural':
+                # Evaluate neural model
+                model.eval()
+                with torch.no_grad():
+                    y_pred = model(X_test_tensor)
+                    test_loss = criterion(y_pred.squeeze(), y_test_tensor).item()
+                
+                # Save model
+                model_path = os.path.join(self.models_dir, "impact_neural.pt")
+                torch.save(model.state_dict(), model_path)
+                
+                self.impact_model = model
+                self.impact_model_type = model_type
+                
+                logger.info(f"Neural model trained and saved: Test Loss = {test_loss:.4f}")
+                
+                return {
+                    "success": True,
+                    "model_type": model_type,
+                    "test_loss": test_loss,
+                    "model_path": model_path,
+                    "features": features
+                }
+            
+        except Exception as e:
+            logger.error(f"Error training impact model: {str(e)}")
+            return {"success": False, "error": str(e)}
+    
+    def predict_impact(self, article_features: Dict[str, Any]) -> float:
+        """
+        Predict the impact of a news article on stock prices.
+        
+        Args:
+            article_features: Dictionary of article features
+            
+        Returns:
+            Predicted impact score
+        """
+        if self.impact_model is None:
+            logger.warning("No impact model loaded, cannot predict")
+            return 0.0
+        
+        try:
+            # Convert features to DataFrame
+            features_df = pd.DataFrame([article_features])
+            
+            # Make prediction based on model type
+            if self.impact_model_type in ['linear', 'random_forest']:
+                prediction = self.impact_model.predict(features_df)[0]
+                return prediction
                 
             elif self.impact_model_type == 'neural':
-                # Convert to PyTorch tensor
-                X_tensor = torch.tensor(X.values, dtype=torch.float32)
+                # Convert to tensor
+                features_tensor = torch.FloatTensor(features_df.values)
                 
                 # Move to GPU if available
-                if self.use_gpu:
-                    X_tensor = X_tensor.cuda()
+                if self.use_gpu and torch.cuda.is_available():
+                    features_tensor = features_tensor.cuda()
                 
-                # Set model to evaluation mode
+                # Make prediction
                 self.impact_model.eval()
-                
-                # Predict
                 with torch.no_grad():
-                    predictions = self.impact_model(X_tensor)
-                    
-                    # Move back to CPU if needed
-                    if self.use_gpu:
-                        predictions = predictions.cpu()
-                    
-                    df['predicted_impact'] = predictions.numpy().flatten()
-            
-            logger.info(f"Predicted impact for {len(df)} articles")
-            return df
+                    prediction = self.impact_model(features_tensor).item()
+                
+                return prediction
+                
         except Exception as e:
             logger.error(f"Error predicting impact: {str(e)}")
-            return articles_df
+            return 0.0
     
-    def visualize_impact(self, articles_df: pd.DataFrame, 
+    def visualize_impact(self, news_df: pd.DataFrame, 
                         stock_data: Dict[str, pd.DataFrame],
                         ticker: str,
                         start_date: Optional[datetime] = None,
-                        end_date: Optional[datetime] = None) -> str:
+                        end_date: Optional[datetime] = None,
+                        save_path: Optional[str] = None) -> None:
         """
         Visualize the impact of news articles on stock prices.
         
         Args:
-            articles_df: DataFrame containing news articles with impact scores
+            news_df: DataFrame containing news articles with impact scores
             stock_data: Dictionary mapping tickers to stock price DataFrames
             ticker: Stock ticker to visualize
             start_date: Start date for visualization
             end_date: End date for visualization
-            
-        Returns:
-            Path to the saved visualization
+            save_path: Path to save the visualization
         """
         if ticker not in stock_data:
-            logger.warning(f"Stock data not found for ticker: {ticker}")
-            return ""
-            
-        if len(articles_df) == 0 or 'impact_score' not in articles_df.columns:
-            logger.warning("No impact scores found in articles DataFrame")
-            return ""
-            
-        logger.info(f"Visualizing impact for ticker: {ticker}")
+            logger.warning(f"Ticker {ticker} not found in stock data")
+            return
         
         try:
-            # Get stock data for the ticker
-            stock_df = stock_data[ticker].copy()
+            # Get stock data for ticker
+            ticker_df = stock_data[ticker].copy()
             
             # Ensure Date column is datetime
-            if 'Date' in stock_df.columns and not pd.api.types.is_datetime64_any_dtype(stock_df['Date']):
-                stock_df['Date'] = pd.to_datetime(stock_df['Date'], format='%Y%m%d')
+            if not pd.api.types.is_datetime64_any_dtype(ticker_df['Date']):
+                ticker_df['Date'] = pd.to_datetime(ticker_df['Date'], format='%Y%m%d')
             
-            # Filter by date range if provided
+            # Filter by date range if specified
             if start_date:
-                stock_df = stock_df[stock_df['Date'] >= start_date]
+                ticker_df = ticker_df[ticker_df['Date'] >= start_date]
             if end_date:
-                stock_df = stock_df[stock_df['Date'] <= end_date]
+                ticker_df = ticker_df[ticker_df['Date'] <= end_date]
             
-            # Filter articles for this ticker
-            ticker_articles = articles_df[articles_df.apply(
-                lambda row: ticker in self._extract_tickers(row), axis=1
-            )].copy()
+            # Filter news for this ticker
+            ticker_news = news_df[
+                news_df.apply(
+                    lambda row: ticker in self._extract_tickers(row), axis=1
+                )
+            ].copy()
             
             # Ensure Date column is datetime
-            if 'Date' in ticker_articles.columns and not pd.api.types.is_datetime64_any_dtype(ticker_articles['Date']):
-                ticker_articles['Date'] = ticker_articles['Date'].apply(
+            if not pd.api.types.is_datetime64_any_dtype(ticker_news['Date']):
+                ticker_news['Date'] = ticker_news['Date'].apply(
                     lambda x: pd.to_datetime(str(x).split()[0], format='%Y%m%d')
                 )
             
-            # Filter by date range if provided
+            # Filter by date range if specified
             if start_date:
-                ticker_articles = ticker_articles[ticker_articles['Date'] >= start_date]
+                ticker_news = ticker_news[ticker_news['Date'] >= start_date]
             if end_date:
-                ticker_articles = ticker_articles[ticker_articles['Date'] <= end_date]
+                ticker_news = ticker_news[ticker_news['Date'] <= end_date]
             
-            # Create the plot
+            # Create plot
             plt.figure(figsize=(12, 8))
             
             # Plot stock price
-            ax1 = plt.subplot(211)
-            ax1.plot(stock_df['Date'], stock_df['End'], label='Stock Price')
-            ax1.set_ylabel('Price')
-            ax1.set_title(f'Stock Price and News Impact for {ticker}')
+            plt.subplot(2, 1, 1)
+            plt.plot(ticker_df['Date'], ticker_df['End'], label='Closing Price')
             
-            # Add markers for news articles
-            for _, article in ticker_articles.iterrows():
-                impact = article.get('impact_score', 0)
-                color = 'green' if impact > 0 else 'red' if impact < 0 else 'gray'
-                size = min(100, abs(impact) * 20 + 20)  # Scale marker size by impact
-                ax1.scatter(article['Date'], stock_df.loc[stock_df['Date'] == article['Date'], 'End'].values[0],
-                           color=color, s=size, alpha=0.7)
+            # Plot news impact
+            for _, row in ticker_news.iterrows():
+                if 'impact_overall' in row and pd.notna(row['impact_overall']):
+                    impact = row['impact_overall']
+                    color = 'green' if impact > 0 else 'red'
+                    alpha = min(abs(impact) / 5, 1.0)  # Scale alpha by impact magnitude
+                    plt.axvline(x=row['Date'], color=color, alpha=alpha, linestyle='--')
             
-            # Plot impact scores
-            ax2 = plt.subplot(212, sharex=ax1)
-            for _, article in ticker_articles.iterrows():
-                impact = article.get('impact_score', 0)
-                color = 'green' if impact > 0 else 'red' if impact < 0 else 'gray'
-                ax2.bar(article['Date'], impact, color=color, alpha=0.7, width=1)
+            plt.title(f'Stock Price and News Impact for {ticker}')
+            plt.ylabel('Price')
+            plt.legend()
             
-            ax2.set_ylabel('Impact Score')
-            ax2.set_xlabel('Date')
+            # Plot volume
+            plt.subplot(2, 1, 2)
+            plt.bar(ticker_df['Date'], ticker_df['Volume'], color='blue', alpha=0.6)
+            plt.ylabel('Volume')
+            plt.xlabel('Date')
             
             plt.tight_layout()
             
-            # Save the plot
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            plot_path = os.path.join(self.models_dir, f"impact_visualization_{ticker}_{timestamp}.png")
-            plt.savefig(plot_path)
-            plt.close()
-            
-            logger.info(f"Saved impact visualization to {plot_path}")
-            return plot_path
+            # Save or show
+            if save_path:
+                plt.savefig(save_path)
+                logger.info(f"Visualization saved to {save_path}")
+            else:
+                plt.show()
+                
         except Exception as e:
             logger.error(f"Error visualizing impact: {str(e)}")
-            return ""
+    
+    def get_top_impactful_news(self, news_df: pd.DataFrame, 
+                              top_n: int = 10, 
+                              impact_col: str = 'impact_overall',
+                              include_negative: bool = True) -> pd.DataFrame:
+        """
+        Get the top most impactful news articles.
+        
+        Args:
+            news_df: DataFrame containing news articles with impact scores
+            top_n: Number of articles to return
+            impact_col: Column to use for impact scores
+            include_negative: Whether to include negative impact articles
+            
+        Returns:
+            DataFrame with top impactful articles
+        """
+        if impact_col not in news_df.columns:
+            logger.warning(f"Impact column {impact_col} not found in DataFrame")
+            return pd.DataFrame()
+        
+        try:
+            # Filter articles with valid impact scores
+            valid_df = news_df.dropna(subset=[impact_col])
+            
+            if include_negative:
+                # Sort by absolute impact
+                sorted_df = valid_df.iloc[
+                    valid_df[impact_col].abs().argsort()[::-1]
+                ]
+            else:
+                # Sort by positive impact only
+                sorted_df = valid_df.sort_values(impact_col, ascending=False)
+            
+            # Return top N
+            return sorted_df.head(top_n)
+            
+        except Exception as e:
+            logger.error(f"Error getting top impactful news: {str(e)}")
+            return pd.DataFrame()
     
     def _extract_tickers(self, row: pd.Series) -> List[str]:
         """
@@ -506,17 +567,20 @@ class StockImpactAnalyzer:
                 else:
                     tickers = [row['tickers']]
         
-        # Instead of extracting from the Link, use the Title field to determine the company
+        # Extract from the Title field to determine the company
         elif 'Title' in row and row['Title']:
             title = row['Title']
-            # Create a mapping of company names to their corresponding tickers
-            company_to_ticker = {
-                "삼성전자": "005930",
-                "SK그룹": "000660",   # Replace with the correct ticker if different
-                # Add more mappings as needed
-            }
-            for company, ticker in company_to_ticker.items():
+            # Use the company to ticker mapping
+            for company, ticker in self.company_ticker_map.items():
                 if company in title:
+                    tickers.append(ticker)
+        
+        # Also check Body if available
+        elif 'Body' in row and row['Body']:
+            body = row['Body']
+            # Use the company to ticker mapping
+            for company, ticker in self.company_ticker_map.items():
+                if company in body:
                     tickers.append(ticker)
         
         return tickers
@@ -561,31 +625,42 @@ class StockImpactAnalyzer:
             # Calculate volume change
             volume_change_pct = (end_row['Volume'] - start_row['Volume']) / start_row['Volume'] * 100 if start_row['Volume'] > 0 else 0
             
+            # Calculate volatility (high-low range)
+            volatility = ((end_row['High'] - end_row['Low']) / end_row['End']) * 100
+            
+            # Calculate additional metrics using open/close data
+            open_close_delta = ((end_row['End'] - end_row['Start']) / end_row['Start']) * 100
+            
             return {
                 'price_change': price_change_pct,
                 'volume_change': volume_change_pct,
+                'volatility': volatility,
+                'open_close_delta': open_close_delta,
                 'start_date': start_row['Date'],
                 'end_date': end_row['Date'],
                 'start_price': start_row['End'],
-                'end_price': end_row['End']
+                'end_price': end_row['End'],
+                'high_price': end_row['High'],
+                'low_price': end_row['Low']
             }
         except Exception as e:
             logger.error(f"Error calculating impact: {str(e)}")
             return None
     
-    def _calculate_impact_score(self, price_change: float, volume_change: float) -> float:
+    def _calculate_impact_score(self, price_change: float, volume_change: float, volatility: float = 0) -> float:
         """
         Calculate an impact score on a scale from -5 to +5.
         
         Args:
             price_change: Percentage change in price
             volume_change: Percentage change in volume
+            volatility: Percentage volatility (high-low range)
             
         Returns:
             Impact score from -5 to +5
         """
-        # Weight price change more heavily than volume change
-        weighted_change = 0.7 * price_change + 0.3 * volume_change
+        # Weight price change more heavily than volume change, and include volatility
+        weighted_change = 0.6 * price_change + 0.25 * volume_change + 0.15 * volatility
         
         # Map to -5 to +5 scale
         # Thresholds from config
@@ -651,11 +726,19 @@ class StockImpactAnalyzer:
         Train a neural network model.
         
         Args:
-            model: Neural network model
-            dataloader: DataLoader with training data
+            model: PyTorch model to train
+            dataloader: DataLoader for training data
             epochs: Number of training epochs
             learning_rate: Learning rate for optimizer
         """
+        # Set device
+        if self.use_gpu and torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+        
+        model = model.to(device)
+        
         # Define loss function and optimizer
         criterion = nn.MSELoss()
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -666,17 +749,14 @@ class StockImpactAnalyzer:
             running_loss = 0.0
             
             for inputs, targets in dataloader:
-                # Move to GPU if available
-                if self.use_gpu:
-                    inputs = inputs.cuda()
-                    targets = targets.cuda()
+                inputs, targets = inputs.to(device), targets.to(device)
                 
                 # Zero the parameter gradients
                 optimizer.zero_grad()
                 
                 # Forward pass
                 outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                loss = criterion(outputs.squeeze(), targets)
                 
                 # Backward pass and optimize
                 loss.backward()
@@ -686,224 +766,99 @@ class StockImpactAnalyzer:
             
             # Log progress
             if (epoch + 1) % 10 == 0:
-                logger.info(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss/len(dataloader):.4f}")
+                logger.info(f'Epoch {epoch+1}/{epochs}, Loss: {running_loss/len(dataloader):.4f}')
     
-    def _save_impact_model(self) -> None:
+    def _map_emotion_to_score(self, emotion: str) -> float:
         """
-        Save the trained impact model.
-        """
-        try:
-            # Create model path
-            model_path = os.path.join(self.models_dir, f"impact_model_{self.impact_model_type}.joblib")
-            
-            if self.impact_model_type in ['random_forest', 'linear']:
-                # Save scikit-learn model
-                joblib.dump(self.impact_model, model_path)
-                
-                # Save features
-                features_path = os.path.join(self.models_dir, "impact_model_features.joblib")
-                joblib.dump(self.model_features, features_path)
-                
-            elif self.impact_model_type == 'neural':
-                # Save PyTorch model
-                torch.save(self.impact_model.state_dict(), model_path)
-                
-                # Save features
-                features_path = os.path.join(self.models_dir, "impact_model_features.joblib")
-                joblib.dump(self.model_features, features_path)
-                
-                # Save model architecture info
-                info_path = os.path.join(self.models_dir, "impact_model_info.joblib")
-                model_info = {
-                    'input_size': self.impact_model.input_size,
-                    'hidden_size': self.impact_model.hidden_size,
-                    'output_size': self.impact_model.output_size
-                }
-                joblib.dump(model_info, info_path)
-            
-            logger.info(f"Saved impact model to {model_path}")
-        except Exception as e:
-            logger.error(f"Error saving impact model: {str(e)}")
-    
-    def load_impact_model(self, model_type: str = None) -> bool:
-        """
-        Load a previously saved impact model.
+        Map emotion string to numerical sentiment score.
         
         Args:
-            model_type: Type of model to load ('random_forest', 'linear', 'neural')
+            emotion: Emotion string from news data
+            
+        Returns:
+            Sentiment score from -1 to 1
+        """
+        if pd.isna(emotion) or not emotion:
+            return 0.0
+            
+        # Convert to lowercase for case-insensitive matching
+        emotion = emotion.lower()
+        
+        # Mapping of emotions to scores
+        emotion_map = {
+            'positive': 1.0,
+            'negative': -1.0,
+            'neutral': 0.0,
+            'mixed': 0.0,
+            '긍정': 1.0,  # Korean for positive
+            '부정': -1.0,  # Korean for negative
+            '중립': 0.0,   # Korean for neutral
+            '혼합': 0.0    # Korean for mixed
+        }
+        
+        # Return mapped score or default to 0
+        return emotion_map.get(emotion, 0.0)
+    
+    def _combine_sentiment_and_impact(self, sentiment_score: float, impact_score: float) -> float:
+        """
+        Combine sentiment and impact scores.
+        
+        Args:
+            sentiment_score: Sentiment score from -1 to 1
+            impact_score: Impact score from -5 to 5
+            
+        Returns:
+            Combined score
+        """
+        # Scale sentiment to match impact range
+        scaled_sentiment = sentiment_score * 2.5
+        
+        # Weighted combination (60% impact, 40% sentiment)
+        combined = 0.6 * impact_score + 0.4 * scaled_sentiment
+        
+        return combined
+    
+    def load_model(self, model_path: str, model_type: str) -> bool:
+        """
+        Load a trained impact model.
+        
+        Args:
+            model_path: Path to the model file
+            model_type: Type of model ('linear', 'random_forest', 'neural')
             
         Returns:
             True if successful, False otherwise
         """
         try:
-            # Determine model type if not provided
-            if model_type is None:
-                # Try to find any saved model
-                for mt in ['random_forest', 'linear', 'neural']:
-                    model_path = os.path.join(self.models_dir, f"impact_model_{mt}.joblib")
-                    if os.path.exists(model_path):
-                        model_type = mt
-                        break
-                
-                if model_type is None:
-                    logger.warning("No saved impact model found")
-                    return False
-            
-            # Load model based on type
-            model_path = os.path.join(self.models_dir, f"impact_model_{model_type}.joblib")
-            features_path = os.path.join(self.models_dir, "impact_model_features.joblib")
-            
-            if not os.path.exists(model_path):
-                logger.warning(f"Impact model not found at {model_path}")
-                return False
-            
-            if not os.path.exists(features_path):
-                logger.warning(f"Model features not found at {features_path}")
-                return False
-            
-            # Load features
-            self.model_features = joblib.load(features_path)
-            
-            if model_type in ['random_forest', 'linear']:
-                # Load scikit-learn model
+            if model_type in ['linear', 'random_forest']:
                 self.impact_model = joblib.load(model_path)
+                self.impact_model_type = model_type
+                logger.info(f"Loaded {model_type} model from {model_path}")
+                return True
                 
             elif model_type == 'neural':
-                # Load model architecture info
-                info_path = os.path.join(self.models_dir, "impact_model_info.joblib")
-                if not os.path.exists(info_path):
-                    logger.warning(f"Model info not found at {info_path}")
-                    return False
-                
-                model_info = joblib.load(info_path)
-                
-                # Create model with same architecture
-                self.impact_model = NeuralImpactModel(
-                    input_size=model_info['input_size'],
-                    hidden_size=model_info['hidden_size'],
-                    output_size=model_info['output_size']
+                # Create a simple model architecture (must match the saved one)
+                input_size = 5  # Default, will need to be adjusted based on actual features
+                model = nn.Sequential(
+                    nn.Linear(input_size, 64),
+                    nn.ReLU(),
+                    nn.Linear(64, 32),
+                    nn.ReLU(),
+                    nn.Linear(32, 1)
                 )
                 
-                # Load weights
-                self.impact_model.load_state_dict(torch.load(model_path))
+                # Load state dict
+                if self.use_gpu and torch.cuda.is_available():
+                    model.load_state_dict(torch.load(model_path))
+                    model = model.cuda()
+                else:
+                    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
                 
-                # Move to GPU if available
-                if self.use_gpu:
-                    self.impact_model = self.impact_model.cuda()
+                self.impact_model = model
+                self.impact_model_type = model_type
+                logger.info(f"Loaded neural model from {model_path}")
+                return True
                 
-                # Set to evaluation mode
-                self.impact_model.eval()
-            
-            self.impact_model_type = model_type
-            logger.info(f"Loaded {model_type} impact model from {model_path}")
-            return True
         except Exception as e:
-            logger.error(f"Error loading impact model: {str(e)}")
+            logger.error(f"Error loading model: {str(e)}")
             return False
-    
-    def _save_impact_results(self, df: pd.DataFrame) -> None:
-        """
-        Save impact analysis results for later use.
-        
-        Args:
-            df: DataFrame with impact scores
-        """
-        try:
-            # Create a timestamp for the filename
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # Save results
-            results_path = os.path.join(self.models_dir, f"impact_results_{timestamp}.csv")
-            df.to_csv(results_path, index=False)
-            
-            logger.info(f"Saved impact results to {results_path}")
-        except Exception as e:
-            logger.error(f"Error saving impact results: {str(e)}")
-
-
-class NeuralImpactModel(nn.Module):
-    """
-    Neural network model for predicting news impact on stock prices.
-    """
-    
-    def __init__(self, input_size: int, hidden_size: int = 64, output_size: int = 1):
-        """
-        Initialize the neural impact model.
-        
-        Args:
-            input_size: Number of input features
-            hidden_size: Size of hidden layers
-            output_size: Number of output values (typically 1 for regression)
-        """
-        super(NeuralImpactModel, self).__init__()
-        
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.output_size = output_size
-        
-        # Define layers
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
-        self.fc3 = nn.Linear(hidden_size // 2, output_size)
-        
-        # Activation functions
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.2)
-    
-    def forward(self, x):
-        """
-        Forward pass through the network.
-        
-        Args:
-            x: Input tensor
-            
-        Returns:
-            Output tensor
-        """
-        x = self.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.relu(self.fc2(x))
-        x = self.dropout(x)
-        x = self.fc3(x)
-        return x
-
-
-# Example usage
-if __name__ == "__main__":
-    # Sample data
-    sample_news = pd.DataFrame({
-        'Title': ['Samsung reports record profits', 'Samsung stock falls on weak guidance'],
-        'Date': [pd.to_datetime('20250101'), pd.to_datetime('20250110')],
-        'tickers': [['005930'], ['005930']]
-    })
-    
-    # Sample stock data
-    sample_stock_data = {
-        '005930': pd.DataFrame({
-            'Date': pd.date_range(start='20250101', periods=20),
-            'End': [100, 102, 105, 103, 101, 99, 98, 96, 95, 97, 99, 100, 102, 104, 105, 107, 106, 105, 103, 102],
-            'Volume': [1000000] * 20
-        })
-    }
-    
-    # Create analyzer
-    analyzer = StockImpactAnalyzer()
-    
-    # Analyze impact
-    results = analyzer.analyze_news_impact(sample_news, sample_stock_data)
-    
-    print("Impact analysis results:")
-    print(results[['Title', 'Date', 'impact_score']])
-    
-    # Train impact model
-    analyzer.train_impact_model(results, sample_stock_data, model_type='random_forest')
-    
-    # Predict impact
-    predictions = analyzer.predict_impact(sample_news)
-    
-    print("\nImpact predictions:")
-    print(predictions[['Title', 'Date', 'predicted_impact']])
-    
-    # Visualize impact
-    viz_path = analyzer.visualize_impact(results, sample_stock_data, '005930')
-    print(f"\nVisualization saved to: {viz_path}")
