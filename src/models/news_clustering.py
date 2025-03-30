@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, timedelta
 import joblib
+from scipy.sparse import issparse
 
 # Configure logging
 logging.basicConfig(
@@ -114,8 +115,15 @@ class NewsClustering:
         df = articles_df.copy()
         
         try:
-            # Extract vectors from DataFrame
-            vectors = np.array(df[vector_col].tolist())
+            vectors_list = []
+            for vec in df[vector_col].tolist():
+                if issparse(vec):
+                    # Convert sparse vector to a 1D dense array
+                    dense_vec = vec.toarray().flatten()
+                    vectors_list.append(dense_vec)
+                else:
+                    vectors_list.append(np.array(vec))
+            vectors = np.array(vectors_list)
             
             # Apply clustering
             if len(vectors) > 1:  # Need at least 2 articles to cluster
@@ -698,6 +706,36 @@ class NewsClustering:
             logger.error(f"Error getting cluster summary: {str(e)}")
             return {'cluster_id': cluster_id, 'error': str(e)}
     
+    def get_cluster_keywords(self, vectorizer, articles_df, cluster_col='cluster_id', text_col='Title', top_n=5):
+        """
+        Extract representative keywords for each cluster using a fitted TF-IDF vectorizer.
+        
+        Args:
+            vectorizer: A fitted TF-IDF vectorizer (e.g., from NewsVectorizer).
+            articles_df: DataFrame containing clustered articles.
+            cluster_col: Name of the column with cluster IDs.
+            text_col: Name of the column containing text for keyword extraction.
+            top_n: Number of top keywords to extract per cluster.
+            
+        Returns:
+            Dictionary mapping each cluster ID to a list of representative keywords.
+        """
+        feature_names = vectorizer.get_feature_names_out()
+        cluster_keywords = {}
+        
+        for cluster_id in articles_df[cluster_col].unique():
+            if cluster_id == -1:
+                continue  # Skip unclustered articles
+            cluster_texts = articles_df[articles_df[cluster_col] == cluster_id][text_col].tolist()
+            combined_text = " ".join(cluster_texts)
+            tfidf_vector = vectorizer.transform([combined_text])
+            tfidf_array = tfidf_vector.toarray().flatten()
+            top_indices = np.argsort(tfidf_array)[::-1][:top_n]
+            keywords = [feature_names[i] for i in top_indices if tfidf_array[i] > 0]
+            cluster_keywords[cluster_id] = keywords
+            
+        return cluster_keywords
+
     def get_all_clusters_summary(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
         """
         Get summaries for all valid clusters.

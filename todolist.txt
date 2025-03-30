@@ -1,0 +1,29 @@
+ToDoList
+
+Reliable models made for here, but some changes in machanism should be made here:
+1. The model should consider those data as 2x rows, as 09:00 for 'open', 15:00 for 'end'. This works as a timestamp. This would lead to making immediate(only 1 block;less then a day), 3 days, then 7 or more days as time window. Current version is not considering those as delta, but wise thing is as:
+09:07 news -> consider 09:00 price, 16:00 news -> consider 15:00(closing) price.
+
+2. Advanced methods should consider more comprehensize methods.
+- Clustering should make similar news more wisely. After that, the model should make the mechanism to show news, while giving news, it should search through same cluster, or some similar news(careful that each news have to have 'target stock'), see through those news to suggest users as:
+{target news} have impact of {impact}, with our history in DB, we found that those kind of news made with stock changed with {history}
+Like this, we should make those mechanism inside the model. While taking the stock impact too, maybe usable?
+ 
+3. For those service to suggest that the previous news has done, maybe we could construct a force-directed (interactive) network diagram where each node represents a news entity. Users could select each news, to find out how previous news gave an impact.
+Use physical repulsion forces in the layout to emphasize the separation and clustering of similar news topics, and enable user interaction to explore how clusters of similar news have historically impacted stock price reactions.
+
+4. At the real service
+At the real service, we could use only the 'immediate' part because we should service to present the news after a day. There, finding our clusters, predicting based on past data would be very important. At the end of the demo should make those consideration, but NO change for existing part, should ADD ON the end of v2 demo.
+
+5. Real Service on
+Now I should say about real-service to go on.
+REAL-service will collect a news each 09:00, 15:00 and 24:00(hyperparameters, using schedule module). After crawling should proceed with previous mechanism, to find out its potential impact related to stock price. After that, with impact and related news' information, it will suggest 'important' news, with related news map in history.
+Automatically renew, and if each time windows going on, re-training(this is the reason why we should take more various methods)
+I made revision of src news crawler since I changed the crawling mechanism. There, you should take a look about the script, and DO NOT change those machanism, just follow them.
+
+6. For Demo v1 and v2
+To let the model taking various methods, I left the v1 keep to debug. Please make aid of those part, after "시장 상관관계 분석 (Analyze Market Correlation)" part to make error(시장 상관관계 분석 오류 (Market correlation analysis error): 'price_change_immediate'), so keep on working here too. v3 should be made, KEEPING ALL of v1 and v2, some new methods using DL, and REAL SERVICE part lastly.
+
+****making
+- Daily Stock data crawl (those cols)
+- Daily NAVER->YNA(or more) crawl / maybe only get if AI summary exists?
