@@ -6,7 +6,7 @@ import os
 import logging
 import pandas as pd
 import numpy as np
-import yfinance as yf
+from pykrx import stock
 from typing import List, Dict, Any, Optional, Union, Tuple
 from datetime import datetime, timedelta
 from tqdm import tqdm
@@ -40,41 +40,41 @@ class StockDataCollector:
         
         logger.info(f"Initialized StockDataCollector with output_dir={self.output_dir}, market={market}")
     
-    def get_stock_data(self, ticker: str, start_date: str, end_date: str, interval: str = "1d") -> pd.DataFrame:
+    def get_stock_data(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
-        Retrieve stock data from Yahoo Finance.
+        Retrieve stock data using pykrx.
         
         Args:
-            ticker: Stock ticker symbol (e.g., "005930.KS" for Samsung in KRX)
+            ticker: Stock ticker symbol (e.g., "005930" for Samsung)
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
-            interval: Data interval (1d, 1wk, 1mo, etc.)
             
         Returns:
             DataFrame with stock price data
         """
-        # Add market suffix if not present
-        if self.market == "KRX" and ".KS" not in ticker:
-            ticker = f"{ticker}.KS"
-            
         try:
             logger.info(f"Retrieving stock data for {ticker} from {start_date} to {end_date}")
             
-            # Get data from Yahoo Finance
-            stock_data = yf.download(
-                ticker,
-                start=start_date,
-                end=end_date,
-                interval=interval,
-                progress=False
-            )
+            # Convert dates to required format
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').strftime('%Y%m%d')
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').strftime('%Y%m%d')
             
-            if stock_data.empty:
+            # Get data using pykrx
+            df = stock.get_market_ohlcv(start_date, end_date, ticker)
+            
+            if df.empty:
                 logger.warning(f"No data found for {ticker}")
                 return pd.DataFrame()
-                
-            logger.info(f"Retrieved {len(stock_data)} records for {ticker}")
-            return stock_data
+            
+            # Reset index to make date a column
+            df = df.reset_index()
+            
+            # Select and rename columns
+            df = df[['날짜', '시가', '고가', '저가', '종가', '거래량']]
+            df.columns = ['Date', 'Start', 'High', 'Low', 'End', 'Volume']
+            
+            logger.info(f"Retrieved {len(df)} records for {ticker}")
+            return df
             
         except Exception as e:
             logger.error(f"Error retrieving stock data: {str(e)}")
@@ -85,7 +85,7 @@ class StockDataCollector:
         Process stock data to match the required format.
         
         Args:
-            data: Raw stock data from Yahoo Finance
+            data: Raw stock data from KRX
             
         Returns:
             Processed DataFrame with the required format
@@ -96,30 +96,22 @@ class StockDataCollector:
         try:
             logger.info("Processing stock data")
             
-            # Reset index to make Date a column
-            df = data.reset_index()
+            # Create a new DataFrame with the required format
+            result_df = pd.DataFrame()
             
-            # Rename columns to match required format
-            df = df.rename(columns={
-                'Date': 'Date',
-                'Open': 'Start',
-                'High': 'High',
-                'Low': 'Low',
-                'Close': 'End',
-                'Volume': 'Volume'
-            })
+            # Process Date and add Time
+            result_df['Date'] = data['Date'].dt.strftime('%Y%m%d')
+            result_df['Time'] = 0
             
-            # Format Date as YYYYMMDD
-            df['Date'] = df['Date'].dt.strftime('%Y%m%d')
+            # Add price data (already in integer format)
+            result_df['Start'] = data['Start'].astype(int)
+            result_df['High'] = data['High'].astype(int)
+            result_df['Low'] = data['Low'].astype(int)
+            result_df['End'] = data['End'].astype(int)
+            result_df['Volume'] = data['Volume'].astype(int)
             
-            # Add Time column (0 for daily data)
-            df['Time'] = 0
-            
-            # Select and reorder columns to match required format
-            result_df = df[['Date', 'Time', 'Start', 'High', 'Low', 'End', 'Volume']]
-            
-            # Calculate additional metrics
-            result_df = self.calculate_additional_metrics(result_df)
+            # Sort by date in descending order
+            result_df = result_df.sort_values('Date', ascending=False)
             
             logger.info(f"Processed {len(result_df)} records")
             return result_df
@@ -166,13 +158,14 @@ class StockDataCollector:
             logger.error(f"Error calculating additional metrics: {str(e)}")
             return df
     
-    def save_stock_data(self, data: pd.DataFrame, ticker: str) -> str:
+    def save_stock_data(self, data: pd.DataFrame, ticker: str, is_test: bool = False) -> str:
         """
         Save stock data to CSV file.
         
         Args:
             data: Processed stock data DataFrame
             ticker: Stock ticker symbol
+            is_test: If True, saves to a test file with '_test' suffix
             
         Returns:
             Path to the saved file
@@ -184,8 +177,9 @@ class StockDataCollector:
         # Clean ticker for filename (remove market suffix)
         clean_ticker = ticker.split('.')[0]
         
-        # Create filename
-        filename = f"stockprice_{clean_ticker}.csv"
+        # Create filename with _test suffix if is_test is True
+        suffix = '_test' if is_test else ''
+        filename = f"stockprice_{clean_ticker}{suffix}.csv"
         filepath = os.path.join(self.output_dir, filename)
         
         try:
@@ -198,26 +192,33 @@ class StockDataCollector:
             logger.error(f"Error saving stock data: {str(e)}")
             return ""
     
-    def collect_stock_data(self, ticker: str, years: int = 5) -> str:
+    def collect_stock_data(self, ticker: str, start_date: str = None, end_date: str = None, years: int = 5) -> str:
         """
-        Collect stock data for a specific ticker for the last N years.
+        Collect stock data for a specific ticker.
         
         Args:
             ticker: Stock ticker symbol
-            years: Number of years of historical data to collect
+            start_date: Start date in YYYY-MM-DD format (optional)
+            end_date: End date in YYYY-MM-DD format (optional)
+            years: Number of years of historical data to collect (used if start_date is not provided)
             
         Returns:
             Path to the saved file
         """
-        # Calculate date range
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=365 * years)
-        
-        # Format dates
-        start_date_str = start_date.strftime('%Y-%m-%d')
-        end_date_str = end_date.strftime('%Y-%m-%d')
-        
-        logger.info(f"Collecting {years} years of stock data for {ticker}")
+        # Calculate date range if not provided
+        if end_date is None:
+            end_date = datetime.now()
+            end_date_str = end_date.strftime('%Y-%m-%d')
+        else:
+            end_date_str = end_date
+            
+        if start_date is None:
+            start_date = end_date - timedelta(days=365 * years)
+            start_date_str = start_date.strftime('%Y-%m-%d')
+        else:
+            start_date_str = start_date
+            
+        logger.info(f"Collecting stock data for {ticker} from {start_date_str} to {end_date_str}")
         
         # Get stock data
         raw_data = self.get_stock_data(ticker, start_date_str, end_date_str)
@@ -336,9 +337,8 @@ if __name__ == "__main__":
     collector = StockDataCollector()
     
     # Collect data for Samsung (005930)
-    filepath = collector.collect_stock_data("005930")
-    print(f"Stock data saved to: {filepath}")
-    
-    # Update existing data
-    success = collector.update_stock_data("005930")
-    print(f"Update successful: {success}")
+    raw_data = collector.get_stock_data("005930", "2019-01-01", "2025-03-31")
+    if not raw_data.empty:
+        processed_data = collector.process_stock_data(raw_data)
+        filepath = collector.save_stock_data(processed_data, "005930", is_test=True)
+        print(f"Test stock data saved to: {filepath}")
